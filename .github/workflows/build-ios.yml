@@ -21,15 +21,53 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
+            ARCHS=arm64 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             DEVELOPMENT_TEAM="" \
             build
-      - name: Package unsigned IPA
+      - name: Ad-hoc sign and package IPA
         run: |
+          set -euo pipefail
+
+          APP_PATH="build/Build/Products/Release-iphoneos/Offline Music.app"
+          EXECUTABLE_PATH="$APP_PATH/Offline Music"
+
+          test -d "$APP_PATH"
+          test -f "$EXECUTABLE_PATH"
+
+          echo "Signing: $APP_PATH"
+          /usr/bin/codesign \
+            --force \
+            --sign - \
+            "$APP_PATH"
+
+          echo "Verifying ad-hoc signature"
+          /usr/bin/codesign --verify --verbose=4 "$APP_PATH"
+          /usr/bin/codesign -d --verbose=4 "$APP_PATH" 2>&1 || true
+
+          echo "Checking executable load commands"
+          /usr/bin/otool -l "$EXECUTABLE_PATH" | grep -A2 -B2 LC_CODE_SIGNATURE
+          test -d "$APP_PATH/_CodeSignature"
+          test -f "$APP_PATH/_CodeSignature/CodeResources"
+
+          echo "Packaging complete app bundle"
+          rm -rf Payload
           mkdir -p Payload
-          cp -R "build/Build/Products/Release-iphoneos/Offline Music.app" Payload/
-          zip -r OfflineMusic-unsigned.ipa Payload
+          cp -R "$APP_PATH" "Payload/Offline Music.app"
+
+          rm -f OfflineMusic-unsigned.ipa
+          zip -qry OfflineMusic-unsigned.ipa Payload
+
+          echo "IPA contents"
+          unzip -l OfflineMusic-unsigned.ipa
+
+          unzip -l OfflineMusic-unsigned.ipa | grep -F "Payload/Offline Music.app/Offline Music"
+          unzip -l OfflineMusic-unsigned.ipa | grep -F "Payload/Offline Music.app/Info.plist"
+          unzip -l OfflineMusic-unsigned.ipa | grep -F "Payload/Offline Music.app/_CodeSignature/CodeResources"
+
+          echo "Packaged app files"
+          find "Payload/Offline Music.app" -maxdepth 3 -type f -print
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
