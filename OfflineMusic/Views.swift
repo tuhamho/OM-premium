@@ -499,12 +499,25 @@ struct ArtworkView: View {
             if let data = song?.artworkData, let image = UIImage(data: data) {
                 Image(uiImage: image).resizable().scaledToFill()
             } else {
-                LinearGradient(colors: [.indigo, .purple, .pink], startPoint: .topLeading, endPoint: .bottomTrailing)
+                LinearGradient(colors: placeholderColors, startPoint: .topLeading, endPoint: .bottomTrailing)
                     .overlay { Image(systemName: "music.note").font(.system(size: size * 0.28)).foregroundStyle(.white.opacity(0.7)) }
             }
         }
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: size > 100 ? 16 : 8))
+    }
+
+    private var placeholderColors: [Color] {
+        let seed = ((song?.title ?? "Offline Music") + (song?.displayAlbum ?? ""))
+            .unicodeScalars
+            .reduce(0) { ($0 * 31 + Int($1.value)) % 5 }
+        switch seed {
+        case 0: return [.indigo, .purple, .pink]
+        case 1: return [.blue, .cyan, .teal]
+        case 2: return [.orange, .red, .pink]
+        case 3: return [.green, .mint, .blue]
+        default: return [.purple, .blue, .cyan]
+        }
     }
 }
 

@@ -51,6 +51,9 @@ import UIKit
     func load() async {
         guard let data = try? Data(contentsOf: stateURL), let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
         songs = state.songs; playlists = state.playlists; recentlyPlayed = state.recentlyPlayed; currentSongID = state.currentSongID; savedPosition = state.savedPosition
+        for index in songs.indices where songs[index].artworkData == nil {
+            songs[index].artworkData = await ArtworkCache.shared.data(for: songs[index].id.uuidString)
+        }
     }
 
     func save() {
@@ -60,6 +63,7 @@ import UIKit
 
     func importFiles(_ urls: [URL]) async -> Int {
         var imported = 0
+        var artworkCandidates: [UUID] = []
         for url in urls {
             guard url.startAccessingSecurityScopedResource() else { continue }
             defer { url.stopAccessingSecurityScopedResource() }
@@ -70,12 +74,17 @@ import UIKit
                 try fm.copyItem(at: url, to: destination)
                 let asset = AVURLAsset(url: destination)
                 var metadata = try await MetadataService.read(asset: asset, fileName: name)
+                metadata.artworkData = ArtworkCache.resizedArtwork(metadata.artworkData)
                 metadata.fileName = relativeDocumentPath(for: destination)
                 songs.append(metadata)
+                if let artwork = metadata.artworkData { await ArtworkCache.shared.store(artwork, for: metadata.id.uuidString) }
+                if metadata.artworkData == nil { artworkCandidates.append(metadata.id) }
                 imported += 1
             } catch { continue }
         }
-        save(); return imported
+        save()
+        if !artworkCandidates.isEmpty { Task { await enrichArtwork(for: artworkCandidates) } }
+        return imported
     }
 
     func rescanDocuments() async {
@@ -110,19 +119,36 @@ import UIKit
 
         let knownPaths = Set(songs.map(\.fileName))
         var importedCount = 0
+        var artworkCandidates: [UUID] = []
         for url in audioFiles {
             scanProgress += 1
             let relativePath = relativeDocumentPath(for: url)
-            guard !knownPaths.contains(relativePath) else { continue }
 
             do {
                 var metadata = try await MetadataService.read(
                     asset: AVURLAsset(url: url),
                     fileName: url.lastPathComponent
                 )
+                metadata.artworkData = ArtworkCache.resizedArtwork(metadata.artworkData)
                 metadata.fileName = relativePath
-                songs.append(metadata)
-                importedCount += 1
+                if let index = songs.firstIndex(where: { $0.fileName == relativePath || (!knownPaths.contains(relativePath) && $0.fileName == url.lastPathComponent) }) {
+                    let existing = songs[index]
+                    metadata.id = existing.id
+                    metadata.importedAt = existing.importedAt
+                    metadata.lastPlayed = existing.lastPlayed
+                    metadata.playCount = existing.playCount
+                    metadata.isFavorite = existing.isFavorite
+                    if metadata.artworkData == nil { metadata.artworkData = existing.artworkData }
+                    songs[index] = metadata
+                } else {
+                    songs.append(metadata)
+                    importedCount += 1
+                }
+                if let artwork = metadata.artworkData {
+                    await ArtworkCache.shared.store(artwork, for: metadata.id.uuidString)
+                } else {
+                    artworkCandidates.append(metadata.id)
+                }
             } catch {
                 print("Metadata failed for \(url.lastPathComponent):", error)
             }
@@ -132,6 +158,20 @@ import UIKit
         isScanning = false
         scanMessage = "Scan complete — \(songs.count) songs found"
         print("Library songs:", songs.count, "(imported:", importedCount, ")")
+
+        if !artworkCandidates.isEmpty {
+            Task { await enrichArtwork(for: artworkCandidates) }
+        }
+    }
+
+    private func enrichArtwork(for ids: [UUID]) async {
+        for id in ids {
+            guard let song = songs.first(where: { $0.id == id }), song.artworkData == nil else { continue }
+            guard let artwork = await ArtworkLookupService.shared.lookup(for: song) else { continue }
+            await ArtworkCache.shared.store(artwork, for: song.id.uuidString)
+            update(song.id) { $0.artworkData = artwork }
+            save()
+        }
     }
 
     nonisolated private static func enumerateAudioFiles(in documentsURL: URL) -> [URL] {
@@ -166,19 +206,176 @@ private struct PersistedState: Codable { var songs: [Song]; var playlists: [Play
 struct MetadataService {
     static func read(asset: AVURLAsset, fileName: String) async throws -> Song {
         let duration = try await asset.load(.duration).seconds
-        let items = try await asset.load(.commonMetadata)
-        func value(_ identifier: AVMetadataIdentifier) -> String { items.first(where: { $0.identifier == identifier })?.stringValue ?? "" }
-        let title = value(.commonIdentifierTitle).isEmpty ? URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent : value(.commonIdentifierTitle)
+        let commonItems = try await asset.load(.commonMetadata)
+        let formatItems = try await asset.load(.metadata)
+        let items = formatItems + commonItems
+
+        func value(_ identifier: AVMetadataIdentifier) -> String {
+            items.first(where: { $0.identifier == identifier })?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+
+        func value(containing text: String) -> String {
+            items.first {
+                $0.identifier.rawValue.localizedCaseInsensitiveContains(text)
+            }?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+
+        let fallback = parseFilename(fileName)
+        let title = value(.commonIdentifierTitle).isEmpty ? fallback.title : value(.commonIdentifierTitle)
+        let artist = value(.commonIdentifierArtist).isEmpty ? fallback.artist : value(.commonIdentifierArtist)
+        let album = value(.commonIdentifierAlbumName).isEmpty ? "Unknown Album" : value(.commonIdentifierAlbumName)
+        let albumArtist = value(containing: "albumartist").isEmpty ? artist : value(containing: "albumartist")
+        let artwork = items.first {
+            $0.commonKey == .commonKeyArtwork || $0.identifier.rawValue.localizedCaseInsensitiveContains("artwork")
+        }?.dataValue
+
         return Song(
-        title: title,
-        artist: value(.commonIdentifierArtist),
-        album: value(.commonIdentifierAlbumName),
-        albumArtist: value(.commonIdentifierArtist),
-        duration: duration.isFinite ? duration : 0,
-        fileName: fileName,
-        artworkData: items.first(where: { $0.commonKey == .commonKeyArtwork })?.dataValue
+            title: title.isEmpty ? "Unknown Title" : title,
+            artist: artist.isEmpty ? "Unknown Artist" : artist,
+            album: album,
+            albumArtist: albumArtist,
+            duration: duration.isFinite ? duration : 0,
+            fileName: fileName,
+            artworkData: artwork
         )
     }
+
+    private static func parseFilename(_ fileName: String) -> (title: String, artist: String) {
+        var name = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
+        name = name.replacingOccurrences(of: #"\[[^\]]*\]|\([^\)]*\)"#, with: "", options: .regularExpression)
+        name = name.replacingOccurrences(of: #"^\s*\d+\s*[-_.]\s*"#, with: "", options: .regularExpression)
+        name = name.replacingOccurrences(of: #"(?i)\b(official\s+audio|official\s+video|lyric\s+video|lyrics|mv|audio|hd|4k)\b"#, with: "", options: .regularExpression)
+        name = name.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let separators = [" - ", " – ", " — ", " | "]
+        for separator in separators {
+            if let range = name.range(of: separator) {
+                let artist = String(name[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let title = String(name[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !artist.isEmpty && !title.isEmpty {
+                    return (title, artist)
+                }
+            }
+        }
+        return (name.isEmpty ? "Unknown Title" : name, "Unknown Artist")
+    }
+}
+
+actor ArtworkCache {
+    static let shared = ArtworkCache()
+    private let directory: URL
+
+    init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        directory = base.appendingPathComponent("ArtworkCache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    func data(for key: String) -> Data? {
+        try? Data(contentsOf: directory.appendingPathComponent(key).appendingPathExtension("jpg"))
+    }
+
+    func store(_ data: Data, for key: String) {
+        try? data.write(to: directory.appendingPathComponent(key).appendingPathExtension("jpg"), options: .atomic)
+    }
+
+    nonisolated static func resizedArtwork(_ data: Data?, maxDimension: CGFloat = 600) -> Data? {
+        guard let data, let image = UIImage(data: data) else { return nil }
+        let scale = min(1, maxDimension / max(image.size.width, image.size.height))
+        let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.jpegData(withCompressionQuality: 0.88) { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+    }
+}
+
+actor ArtworkLookupService {
+    static let shared = ArtworkLookupService()
+    private var lastMusicBrainzRequest = Date.distantPast
+
+    func lookup(for song: Song) async -> Data? {
+        guard song.title != "Unknown Title" else { return nil }
+        guard let releaseID = await matchingReleaseID(for: song) else { return nil }
+        guard let url = URL(string: "https://coverartarchive.org/release/\(releaseID)/front-500") else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        return ArtworkCache.resizedArtwork(data)
+    }
+
+    private func matchingReleaseID(for song: Song) async -> String? {
+        let artist = song.artist == "Unknown Artist" ? "" : song.artist
+        let query = artist.isEmpty ? "recording:\"\(song.title)\"" : "artist:\"\(artist)\" AND recording:\"\(song.title)\""
+        var components = URLComponents(string: "https://musicbrainz.org/ws/2/recording/")
+        components?.queryItems = [
+            URLQueryItem(name: "query", value: query),
+            URLQueryItem(name: "fmt", value: "json"),
+            URLQueryItem(name: "limit", value: "5")
+        ]
+        guard let url = components?.url else { return nil }
+
+        let wait = max(0, 1.0 - Date().timeIntervalSince(lastMusicBrainzRequest))
+        if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+        lastMusicBrainzRequest = Date()
+
+        var request = URLRequest(url: url)
+        request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let result = try? JSONDecoder().decode(MusicBrainzResponse.self, from: data) else { return nil }
+
+        let title = normalized(song.title)
+        let artist = normalized(song.artist)
+        let matches = result.recordings
+            .filter { recording in
+                let resultTitle = normalized(recording.title ?? "")
+                let resultArtist = normalized(recording.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: " ") ?? "")
+                let titleMatches = resultTitle == title || resultTitle.contains(title) || title.contains(resultTitle)
+                let artistMatches = artist == "unknownartist" || resultArtist.contains(artist) || artist.contains(resultArtist)
+                return (recording.score ?? 0) >= 90 && titleMatches && artistMatches
+            }
+        guard matches.count == 1 else { return nil }
+        return matches[0].releases?.first?.id
+    }
+
+    private func normalized(_ value: String) -> String {
+        value.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .filter { $0.isLetter || $0.isNumber }
+    }
+}
+
+private struct MusicBrainzResponse: Decodable {
+    let recordings: [MusicBrainzRecording]
+}
+
+private struct MusicBrainzRecording: Decodable {
+    let title: String?
+    let score: Int?
+    let artistCredit: [MusicBrainzArtistCredit]?
+    let releases: [MusicBrainzRelease]?
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case score
+        case artistCredit = "artist-credit"
+        case releases
+    }
+}
+
+private struct MusicBrainzArtistCredit: Decodable {
+    let name: String?
+    let artist: MusicBrainzArtist?
+}
+
+private struct MusicBrainzArtist: Decodable {
+    let name: String?
+}
+
+private struct MusicBrainzRelease: Decodable {
+    let id: String
 }
 
 @MainActor final class AudioPlayerService: ObservableObject {
