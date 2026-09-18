@@ -449,7 +449,8 @@ actor ArtworkLookupService {
         }
         print("MusicBrainz selected candidate:", best.candidate.artist, "/", best.candidate.title, "score:", best.score, "release IDs:", best.releaseIDs)
         debugLogs.append("Selected: \(best.candidate.artist) - \(best.candidate.title)")
-        debugLogs.append("Release IDs: \(best.releaseIDs.joined(separator: ", "))")
+        let releaseList = best.releaseIDs.joined(separator: ", ")
+        debugLogs.append("Release IDs: \(releaseList)")
         best.applyFilenameMetadata = filenameFallback
         return best
     }
@@ -500,7 +501,8 @@ actor ArtworkLookupService {
             let artist = recording.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: ", ") ?? "Unknown Artist"
             let releases = recording.releases?.compactMap(\.id).joined(separator: ", ") ?? "none"
             let duration = recording.length.map { "\(Double($0) / 1000)s" } ?? "unknown duration"
-            debugLogs.append("Candidate: \(recording.title ?? \"\") — \(artist), score \(recording.score ?? 0), releases \(releases), duration \(duration)")
+            let candidateTitle = recording.title ?? ""
+            debugLogs.append("Candidate: \(candidateTitle) — \(artist), score \(recording.score ?? 0), releases \(releases), duration \(duration)")
         }
 
         let title = normalized(candidate.title)
