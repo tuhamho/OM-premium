@@ -220,7 +220,7 @@ struct MetadataService {
 
         func value(containing text: String) -> String {
             items.first {
-                $0.identifier.rawValue.localizedCaseInsensitiveContains(text)
+                $0.identifier?.rawValue.localizedCaseInsensitiveContains(text) == true
             }?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
 
@@ -230,7 +230,7 @@ struct MetadataService {
         let album = value(.commonIdentifierAlbumName).isEmpty ? "Unknown Album" : value(.commonIdentifierAlbumName)
         let albumArtist = value(containing: "albumartist").isEmpty ? artist : value(containing: "albumartist")
         let artwork = items.first {
-            $0.commonKey == .commonKeyArtwork || $0.identifier.rawValue.localizedCaseInsensitiveContains("artwork")
+            $0.commonKey == .commonKeyArtwork || ($0.identifier?.rawValue.localizedCaseInsensitiveContains("artwork") == true)
         }?.dataValue
 
         return Song(
@@ -374,13 +374,13 @@ actor ArtworkLookupService {
               let result = try? JSONDecoder().decode(MusicBrainzResponse.self, from: data) else { return nil }
 
         let title = normalized(candidate.title)
-        let artist = normalized(candidate.artist)
+        let normalizedArtist = normalized(candidate.artist)
         let matches = result.recordings
             .compactMap { recording -> MusicBrainzMatch? in
                 let resultTitle = normalized(recording.title ?? "")
                 let resultArtist = normalized(recording.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: " ") ?? "")
                 let titleSimilarity = similarity(resultTitle, title)
-                let artistSimilarity = artist == "unknownartist" ? 1 : similarity(resultArtist, artist)
+                let artistSimilarity = normalizedArtist == "unknownartist" ? 1 : similarity(resultArtist, normalizedArtist)
                 guard (recording.score ?? 0) >= 90, titleSimilarity >= 0.8, artistSimilarity >= 0.8,
                       let releaseID = recording.releases?.first?.id else { return nil }
                 var confidence = Double(recording.score ?? 0) + titleSimilarity * 20 + artistSimilarity * 20
