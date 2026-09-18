@@ -35,6 +35,7 @@ struct RootView: View {
         }
         .background(Color.ink.ignoresSafeArea())
         .sheet(isPresented: $showNowPlaying) { NowPlayingView() }
+        .sheet(isPresented: $store.showDebugPanel) { DebugStatusView() }
     }
 
     private func tabButton(_ icon: String, _ text: String, _ value: Int) -> some View {
@@ -307,6 +308,9 @@ struct SettingsView: View {
                     Toggle("Pure black OLED theme", isOn: $store.oledTheme)
                 }
                 Section("Library") {
+                    Button("Test MusicBrainz Connection") {
+                        Task { await store.testMusicBrainzConnection() }
+                    }
                     Button("Rescan files") {
                         Task {
                             await store.rescanDocuments()
@@ -472,6 +476,7 @@ struct SongCard: View {
 struct SongRow: View {
     let song: Song
     var play: () -> Void
+    @EnvironmentObject private var store: MusicStore
 
     var body: some View {
         Button(action: play) {
@@ -487,6 +492,43 @@ struct SongRow: View {
         }
         .listRowBackground(Color.clear)
         .buttonStyle(.plain)
+        .contextMenu {
+            Button {
+                store.startSongDebug(song)
+            } label: {
+                Label("Identify & Fetch Artwork", systemImage: "wand.and.stars")
+            }
+        }
+    }
+}
+
+struct DebugStatusView: View {
+    @EnvironmentObject private var store: MusicStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(store.debugLines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.footnote.monospaced())
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if store.isDebuggingSong {
+                        ProgressView("Working...")
+                    }
+                }
+                .padding()
+            }
+            .background(Color.ink)
+            .navigationTitle("Metadata Debug")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
     }
 }
 

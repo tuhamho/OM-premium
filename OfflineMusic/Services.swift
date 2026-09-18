@@ -17,9 +17,13 @@ import UIKit
     @Published var scanProgress = 0
     @Published var scanTotal = 0
     @Published var scanMessage = ""
+    @Published var debugLines: [String] = []
+    @Published var isDebuggingSong = false
+    @Published var showDebugPanel = false
 
     private let stateURL: URL
     private let fm = FileManager.default
+    private weak var player: AudioPlayerService?
 
     init() {
         let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -61,9 +65,17 @@ import UIKit
         if let data = try? JSONEncoder().encode(state) { try? data.write(to: stateURL, options: .atomic) }
     }
 
+    func attach(player: AudioPlayerService) {
+        self.player = player
+    }
+
+    func startSongDebug(_ song: Song) {
+        showDebugPanel = true
+        Task { await identifyAndFetchArtwork(for: song.id) }
+    }
+
     func importFiles(_ urls: [URL]) async -> Int {
         var imported = 0
-        var artworkCandidates: [UUID] = []
         for url in urls {
             guard url.startAccessingSecurityScopedResource() else { continue }
             defer { url.stopAccessingSecurityScopedResource() }
@@ -78,12 +90,10 @@ import UIKit
                 metadata.fileName = relativeDocumentPath(for: destination)
                 songs.append(metadata)
                 if let artwork = metadata.artworkData { await ArtworkCache.shared.store(artwork, for: metadata.id.uuidString) }
-                if metadata.artworkData == nil { artworkCandidates.append(metadata.id) }
                 imported += 1
             } catch { continue }
         }
         save()
-        if !artworkCandidates.isEmpty { Task { await enrichArtwork(for: artworkCandidates) } }
         return imported
     }
 
@@ -119,7 +129,6 @@ import UIKit
 
         let knownPaths = Set(songs.map(\.fileName))
         var importedCount = 0
-        var artworkCandidates: [UUID] = []
         for url in audioFiles {
             scanProgress += 1
             let relativePath = relativeDocumentPath(for: url)
@@ -146,8 +155,6 @@ import UIKit
                 }
                 if let artwork = metadata.artworkData {
                     await ArtworkCache.shared.store(artwork, for: metadata.id.uuidString)
-                } else {
-                    artworkCandidates.append(metadata.id)
                 }
             } catch {
                 print("Metadata failed for \(url.lastPathComponent):", error)
@@ -158,32 +165,55 @@ import UIKit
         isScanning = false
         scanMessage = "Scan complete — \(songs.count) songs found"
         print("Library songs:", songs.count, "(imported:", importedCount, ")")
-
-        if !artworkCandidates.isEmpty {
-            Task { await enrichArtwork(for: artworkCandidates) }
-        }
     }
 
-    private func enrichArtwork(for ids: [UUID]) async {
-        for id in ids {
-            guard let song = songs.first(where: { $0.id == id }), song.artworkData == nil else { continue }
-            guard let result = await ArtworkLookupService.shared.lookup(for: song) else { continue }
-            if let artwork = result.artwork { await ArtworkCache.shared.store(artwork, for: song.id.uuidString) }
-            update(song.id) {
-                if result.applyFilenameMetadata {
-                    $0.artist = result.candidate.artist
-                    $0.title = result.candidate.title
-                }
-                if $0.album == "Unknown Album", let album = result.album { $0.album = album }
-                if result.applyFilenameMetadata, let albumArtist = result.albumArtist {
-                    $0.albumArtist = albumArtist
-                } else if ($0.albumArtist.isEmpty || $0.albumArtist == "Unknown Artist"), let albumArtist = result.albumArtist {
-                    $0.albumArtist = albumArtist
-                }
-                if let artwork = result.artwork { $0.artworkData = artwork }
-            }
-            save()
+    func identifyAndFetchArtwork(for id: UUID) async {
+        guard !isDebuggingSong else { return }
+        guard let index = songs.firstIndex(where: { $0.id == id }) else { return }
+        isDebuggingSong = true
+        debugLines = ["Parsing filename...", "File: \(songs[index].fileName)"]
+        defer { isDebuggingSong = false }
+
+        let song = songs[index]
+        let hasEmbeddedArtwork = song.artworkData != nil
+        let result = await ArtworkLookupService.shared.lookup(for: song)
+        debugLines.append(contentsOf: result.logs)
+
+        guard let candidate = result.candidate else {
+            debugLines.append("Song not changed")
+            return
         }
+
+        var updated = songs[index]
+        if result.applyFilenameMetadata {
+            updated.title = candidate.title
+            updated.artist = candidate.artist
+        }
+        if updated.album == "Unknown Album", let album = result.album { updated.album = album }
+        if result.applyFilenameMetadata, let albumArtist = result.albumArtist { updated.albumArtist = albumArtist }
+        if updated.albumArtist.isEmpty || updated.albumArtist == "Unknown Artist", let albumArtist = result.albumArtist { updated.albumArtist = albumArtist }
+        if let artwork = result.artwork, !hasEmbeddedArtwork {
+            await ArtworkCache.shared.store(artwork, for: updated.id.uuidString)
+            updated.artworkData = artwork
+        } else if hasEmbeddedArtwork {
+            debugLines.append("Embedded artwork preserved")
+        }
+
+        songs[index] = updated
+        objectWillChange.send()
+        debugLines.append("Song updated")
+        save()
+        debugLines.append("Saved successfully")
+        player?.syncCurrentSong(updated)
+    }
+
+    func testMusicBrainzConnection() async {
+        showDebugPanel = true
+        isDebuggingSong = true
+        debugLines = ["Testing MusicBrainz Connection..."]
+        let result = await ArtworkLookupService.shared.testConnection()
+        debugLines.append(contentsOf: result)
+        isDebuggingSong = false
     }
 
     nonisolated private static func enumerateAudioFiles(in documentsURL: URL) -> [URL] {
@@ -331,31 +361,64 @@ actor ArtworkCache {
 actor ArtworkLookupService {
     static let shared = ArtworkLookupService()
     private var lastMusicBrainzRequest = Date.distantPast
+    private var debugLogs: [String] = []
 
-    func lookup(for song: Song) async -> ArtworkLookupResult? {
-        guard song.title != "Unknown Title" else { return nil }
-        guard let match = await matchingRelease(for: song) else { return nil }
+    func lookup(for song: Song) async -> ArtworkLookupResult {
+        debugLogs = ["Searching MusicBrainz..."]
+        guard song.title != "Unknown Title" else {
+            debugLogs.append("No usable title")
+            return ArtworkLookupResult(candidate: nil, album: nil, albumArtist: nil, artwork: nil, applyFilenameMetadata: false, logs: debugLogs)
+        }
+        guard let match = await matchingRelease(for: song) else {
+            debugLogs.append("No acceptable candidate")
+            return ArtworkLookupResult(candidate: nil, album: nil, albumArtist: nil, artwork: nil, applyFilenameMetadata: false, logs: debugLogs)
+        }
         var artwork: Data?
         for releaseID in match.releaseIDs {
             guard let url = URL(string: "https://coverartarchive.org/release/\(releaseID)/front-500") else { continue }
             print("Cover Art Archive URL:", url.absoluteString)
+            debugLogs.append("Fetching cover art release \(releaseID)...")
+            debugLogs.append("Cover Art Archive URL: \(url.absoluteString)")
             var request = URLRequest(url: url)
             request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
             do {
                 let (data, response) = try await URLSession.shared.data(for: request)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? -1
                 print("Artwork HTTP status:", status)
+                debugLogs.append("Artwork HTTP status: \(status)")
                 if status == 200 {
                     artwork = ArtworkCache.resizedArtwork(data)
                     print("Artwork decoding:", artwork == nil ? "failed" : "succeeded")
+                    debugLogs.append(artwork == nil ? "Image decode failed" : "Artwork decoded")
                     if artwork != nil { break }
                 }
             } catch {
                 print("Artwork lookup failed:", error)
+                debugLogs.append("Cover Art Archive error: \(error.localizedDescription)")
             }
         }
+        if artwork == nil { debugLogs.append("No usable cover art found in checked releases") }
         print("MusicBrainz selected recording score:", match.score, "candidate:", match.candidate.artist, "/", match.candidate.title)
-        return ArtworkLookupResult(candidate: match.candidate, album: match.album, albumArtist: match.albumArtist, artwork: artwork, applyFilenameMetadata: match.applyFilenameMetadata)
+        return ArtworkLookupResult(candidate: match.candidate, album: match.album, albumArtist: match.albumArtist, artwork: artwork, applyFilenameMetadata: match.applyFilenameMetadata, logs: debugLogs)
+    }
+
+    func testConnection() async -> [String] {
+        let query = "artist:\"The Beatles\" AND recording:\"Yesterday\""
+        var components = URLComponents(string: "https://musicbrainz.org/ws/2/recording/")
+        components?.queryItems = [URLQueryItem(name: "query", value: query), URLQueryItem(name: "fmt", value: "json"), URLQueryItem(name: "limit", value: "1")]
+        guard let url = components?.url else { return ["Could not create test URL"] }
+        let userAgent = "OfflineMusic/1.0 (local music library)"
+        var request = URLRequest(url: url)
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let decoded = (try? JSONDecoder().decode(MusicBrainzResponse.self, from: data)) != nil
+            let decodedText = decoded ? "yes" : "no"
+            return ["Request URL: \(url.absoluteString)", "User-Agent sent: \(userAgent)", "HTTP status: \(status)", "Response received: yes (\(data.count) bytes)", "JSON decoded: \(decodedText)"]
+        } catch {
+            return ["Request URL: \(url.absoluteString)", "User-Agent sent: \(userAgent)", "Response received: no", "Network error: \(error.localizedDescription)"]
+        }
     }
 
     private func matchingRelease(for song: Song) async -> MusicBrainzMatch? {
@@ -370,10 +433,23 @@ actor ArtworkLookupService {
                 matches.append(match)
             }
         }
-        guard var best = matches.max(by: { $0.confidence < $1.confidence }) else { return nil }
+        guard var best = matches.max(by: { $0.confidence < $1.confidence }) else {
+            debugLogs.append("No MusicBrainz candidate passed the confidence threshold")
+            return nil
+        }
         let secondBest = matches.filter { $0.candidate.artist != best.candidate.artist || $0.candidate.title != best.candidate.title }.max(by: { $0.confidence < $1.confidence })
-        guard secondBest == nil || best.confidence - secondBest!.confidence >= 12 else { return nil }
+        if let secondBest {
+            debugLogs.append("Best candidate: \(best.score), second-best: \(secondBest.score)")
+        } else {
+            debugLogs.append("Best candidate: \(best.score), second-best: none")
+        }
+        guard secondBest == nil || best.confidence - secondBest!.confidence >= 12 else {
+            debugLogs.append("Result rejected: candidates were too close")
+            return nil
+        }
         print("MusicBrainz selected candidate:", best.candidate.artist, "/", best.candidate.title, "score:", best.score, "release IDs:", best.releaseIDs)
+        debugLogs.append("Selected: \(best.candidate.artist) - \(best.candidate.title)")
+        debugLogs.append("Release IDs: \(best.releaseIDs.joined(separator: ", "))")
         best.applyFilenameMetadata = filenameFallback
         return best
     }
@@ -394,10 +470,38 @@ actor ArtworkLookupService {
         lastMusicBrainzRequest = Date()
 
         var request = URLRequest(url: url)
-        request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let result = try? JSONDecoder().decode(MusicBrainzResponse.self, from: data) else { return nil }
+        let userAgent = "OfflineMusic/1.0 (local music library)"
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        debugLogs.append("MusicBrainz request URL: \(url.absoluteString)")
+        debugLogs.append("User-Agent sent: \(userAgent)")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            debugLogs.append("MusicBrainz network error: \(error.localizedDescription)")
+            return nil
+        }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        debugLogs.append("MusicBrainz HTTP status: \(status)")
+        debugLogs.append("MusicBrainz response bytes: \(data.count)")
+        guard status == 200 else { return nil }
+        guard let result = try? JSONDecoder().decode(MusicBrainzResponse.self, from: data) else {
+            debugLogs.append("MusicBrainz JSON decode failed")
+            return nil
+        }
+        debugLogs.append("MusicBrainz recordings returned: \(result.recordings.count)")
+        if let highestScore = result.recordings.compactMap(\.score).max(), highestScore < 90 {
+            debugLogs.append("Best candidate: \(highestScore), required: 90, result rejected")
+        }
+
+        for recording in result.recordings.prefix(5) {
+            let artist = recording.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: ", ") ?? "Unknown Artist"
+            let releases = recording.releases?.compactMap(\.id).joined(separator: ", ") ?? "none"
+            let duration = recording.length.map { "\(Double($0) / 1000)s" } ?? "unknown duration"
+            debugLogs.append("Candidate: \(recording.title ?? \"\") — \(artist), score \(recording.score ?? 0), releases \(releases), duration \(duration)")
+        }
 
         let title = normalized(candidate.title)
         let normalizedArtist = normalized(candidate.artist)
@@ -437,11 +541,12 @@ actor ArtworkLookupService {
 }
 
 struct ArtworkLookupResult {
-    let candidate: FilenameCandidate
+    let candidate: FilenameCandidate?
     let album: String?
     let albumArtist: String?
     let artwork: Data?
     let applyFilenameMetadata: Bool
+    let logs: [String]
 }
 
 private struct MusicBrainzMatch {
@@ -515,6 +620,11 @@ private struct MusicBrainzRelease: Decodable {
         self.store = store
         if store.resumeSession, let restored = store.song(store.currentSongID) { currentSong = restored; duration = restored.duration; elapsed = store.savedPosition }
         configureAudioSession(); configureRemoteCommands()
+    }
+    func syncCurrentSong(_ song: Song) {
+        guard currentSong?.id == song.id else { return }
+        currentSong = song
+        updateNowPlaying()
     }
     private func configureAudioSession() { try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: []); try? AVAudioSession.sharedInstance().setActive(true) }
 
