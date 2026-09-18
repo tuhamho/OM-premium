@@ -43,8 +43,12 @@ jobs:
             "$APP_PATH/Info.plist"
           BUILT_EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist")
           BUILT_PACKAGE_TYPE=$(/usr/libexec/PlistBuddy -c "Print :CFBundlePackageType" "$APP_PATH/Info.plist")
+          BUILT_FILE_SHARING=$(/usr/libexec/PlistBuddy -c "Print :UIFileSharingEnabled" "$APP_PATH/Info.plist")
+          BUILT_DOCUMENTS_IN_PLACE=$(/usr/libexec/PlistBuddy -c "Print :LSSupportsOpeningDocumentsInPlace" "$APP_PATH/Info.plist")
           test "$BUILT_EXECUTABLE" = "Offline Music"
           test "$BUILT_PACKAGE_TYPE" = "APPL"
+          test "$BUILT_FILE_SHARING" = "true"
+          test "$BUILT_DOCUMENTS_IN_PLACE" = "true"
 
           echo "Signing: $APP_PATH"
           /usr/bin/codesign \

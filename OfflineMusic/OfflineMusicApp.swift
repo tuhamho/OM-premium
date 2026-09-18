@@ -14,6 +14,7 @@ struct OfflineMusicApp: App {
                 .task {
                     await store.load()
                     player.configure(with: store)
+                    await store.rescanDocuments()
                 }
         }
     }

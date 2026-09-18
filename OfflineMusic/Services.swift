@@ -13,6 +13,10 @@ import UIKit
     @Published var resumeSession = true
     @Published var oledTheme = false
     @Published var accent = Color.lime
+    @Published var isScanning = false
+    @Published var scanProgress = 0
+    @Published var scanTotal = 0
+    @Published var scanMessage = ""
 
     private let stateURL: URL
     private let fm = FileManager.default
@@ -24,9 +28,24 @@ import UIKit
     }
 
     var audioDirectory: URL {
-        let dir = fm.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Audio")
+        let dir = documentsDirectory.appendingPathComponent("Audio")
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    private var documentsDirectory: URL {
+        fm.urls(for: .documentDirectory, in: .userDomainMask).first!
+    }
+
+    func documentURL(for fileName: String) -> URL {
+        let url = documentsDirectory.appendingPathComponent(fileName)
+        if fm.fileExists(atPath: url.path) { return url }
+        return audioDirectory.appendingPathComponent(fileName)
+    }
+
+    private func relativeDocumentPath(for url: URL) -> String {
+        let prefix = documentsDirectory.path.hasSuffix("/") ? documentsDirectory.path : documentsDirectory.path + "/"
+        return url.path.hasPrefix(prefix) ? String(url.path.dropFirst(prefix.count)) : url.lastPathComponent
     }
 
     func load() async {
@@ -51,7 +70,7 @@ import UIKit
                 try fm.copyItem(at: url, to: destination)
                 let asset = AVURLAsset(url: destination)
                 var metadata = try await MetadataService.read(asset: asset, fileName: name)
-                metadata.fileName = destination.lastPathComponent
+                metadata.fileName = relativeDocumentPath(for: destination)
                 songs.append(metadata)
                 imported += 1
             } catch { continue }
@@ -59,11 +78,85 @@ import UIKit
         save(); return imported
     }
 
+    func rescanDocuments() async {
+        guard !isScanning else { return }
+
+        isScanning = true
+        scanProgress = 0
+        scanTotal = 0
+        scanMessage = ""
+
+        let documentsURL = documentsDirectory
+        print("Documents:", documentsURL.path)
+
+        let audioFiles = await Task.detached(priority: .utility) {
+            Self.enumerateAudioFiles(in: documentsURL)
+        }.value
+
+        print("Audio files found:", audioFiles.count)
+        scanTotal = audioFiles.count
+
+        let foundPaths = Set(audioFiles.map { relativeDocumentPath(for: $0) })
+        let missingIDs = songs.compactMap { song in
+            foundPaths.contains(song.fileName) || fm.fileExists(atPath: documentURL(for: song.fileName).path) ? nil : song.id
+        }
+        if !missingIDs.isEmpty {
+            songs.removeAll { missingIDs.contains($0.id) }
+            recentlyPlayed.removeAll { missingIDs.contains($0) }
+            playlists.indices.forEach { index in
+                playlists[index].songIDs.removeAll { missingIDs.contains($0) }
+            }
+        }
+
+        let knownPaths = Set(songs.map(\.fileName))
+        var importedCount = 0
+        for url in audioFiles {
+            scanProgress += 1
+            let relativePath = relativeDocumentPath(for: url)
+            guard !knownPaths.contains(relativePath) else { continue }
+
+            do {
+                var metadata = try await MetadataService.read(
+                    asset: AVURLAsset(url: url),
+                    fileName: url.lastPathComponent
+                )
+                metadata.fileName = relativePath
+                songs.append(metadata)
+                importedCount += 1
+            } catch {
+                print("Metadata failed for \(url.lastPathComponent):", error)
+            }
+        }
+
+        save()
+        isScanning = false
+        scanMessage = "Scan complete — \(songs.count) songs found"
+        print("Library songs:", songs.count, "(imported:", importedCount, ")")
+    }
+
+    nonisolated private static func enumerateAudioFiles(in documentsURL: URL) -> [URL] {
+        let supportedExtensions = Set(["mp3", "m4a", "aac", "wav", "caf", "aiff"])
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(
+            at: documentsURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        return enumerator.compactMap { item in
+            guard let url = item as? URL,
+                  supportedExtensions.contains(url.pathExtension.lowercased()),
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true else { return nil }
+            return url
+        }
+    }
+
     func toggleFavorite(_ song: Song) { update(song.id) { $0.isFavorite.toggle() }; save() }
     func update(_ id: UUID, _ change: (inout Song) -> Void) { guard let i = songs.firstIndex(where: { $0.id == id }) else { return }; change(&songs[i]) }
     func song(_ id: UUID?) -> Song? { songs.first { $0.id == id } }
     func markPlayed(_ id: UUID) { update(id) { $0.playCount += 1; $0.lastPlayed = .now }; recentlyPlayed.removeAll { $0 == id }; recentlyPlayed.insert(id, at: 0); recentlyPlayed = Array(recentlyPlayed.prefix(30)); currentSongID = id; save() }
-    func delete(_ song: Song) { try? fm.removeItem(at: audioDirectory.appendingPathComponent(song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; save() }
+    func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; save() }
     func addPlaylist(name: String) { playlists.append(Playlist(name: name)); save() }
     func songs(in playlist: Playlist) -> [Song] { playlist.songIDs.compactMap(song) }
 }
@@ -115,7 +208,7 @@ struct MetadataService {
         if currentSong?.id == song.id { if !isPlaying { player?.play(); isPlaying = true }; return }
         if let list { queue = list }
         currentSong = song; duration = song.duration; store?.markPlayed(song.id); elapsed = 0
-        let url = store?.audioDirectory.appendingPathComponent(song.fileName)
+        let url = store?.documentURL(for: song.fileName)
         guard let url else { return }
         player?.pause(); if let timeObserver { player?.removeTimeObserver(timeObserver) }
         let item = AVPlayerItem(url: url); player = AVPlayer(playerItem: item); player?.rate = speed

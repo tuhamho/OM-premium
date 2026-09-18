@@ -307,7 +307,25 @@ struct SettingsView: View {
                     Toggle("Pure black OLED theme", isOn: $store.oledTheme)
                 }
                 Section("Library") {
-                    Button("Rescan files") {}
+                    Button("Rescan files") {
+                        Task {
+                            await store.rescanDocuments()
+                        }
+                    }
+                    .disabled(store.isScanning)
+
+                    if store.isScanning {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ProgressView()
+                            Text("Scanning music...")
+                            Text("\(store.scanProgress) / \(store.scanTotal)")
+                                .foregroundStyle(Color.muted)
+                        }
+                    } else if !store.scanMessage.isEmpty {
+                        Text(store.scanMessage)
+                            .foregroundStyle(Color.muted)
+                    }
+
                     Button("Clear artwork cache") {}
                     Text("\(store.songs.count) songs • \(store.songs.reduce(0) { $0 + Int($1.duration) / 60 }) minutes")
                         .foregroundStyle(Color.muted)
