@@ -32,6 +32,27 @@ struct Playlist: Identifiable, Codable, Hashable {
     var createdAt: Date = .now
 }
 
+struct ArtistGroup: Identifiable {
+    let id: String
+    let name: String
+    let songs: [Song]
+
+    var representativeSong: Song? {
+        songs.first(where: { $0.artworkData != nil }) ?? songs.first
+    }
+}
+
+struct AlbumGroup: Identifiable {
+    let id: String
+    let name: String
+    let artist: String
+    let songs: [Song]
+
+    var representativeSong: Song? {
+        songs.first(where: { $0.artworkData != nil }) ?? songs.first
+    }
+}
+
 enum RepeatMode: String, Codable, CaseIterable { case off, all, one }
 enum LibraryFilter: String, CaseIterable { case songs = "Songs", albums = "Albums", artists = "Artists", playlists = "Playlists", favorites = "Favorites" }
 enum SortMode: String, CaseIterable { case recentlyAdded = "Recently Added", title = "Title", artist = "Artist", album = "Album", mostPlayed = "Most Played", duration = "Duration" }

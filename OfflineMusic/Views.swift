@@ -134,27 +134,74 @@ struct LibraryView: View {
         return result
     }
 
+    private var visibleArtistGroups: [ArtistGroup] {
+        guard !search.isEmpty else { return store.artistGroups }
+        return store.artistGroups.filter { group in
+            group.name.localizedCaseInsensitiveContains(search) ||
+            group.songs.contains { $0.title.localizedCaseInsensitiveContains(search) || $0.album.localizedCaseInsensitiveContains(search) }
+        }
+    }
+
+    private var visibleAlbumGroups: [AlbumGroup] {
+        guard !search.isEmpty else { return store.albumGroups }
+        return store.albumGroups.filter {
+            $0.name.localizedCaseInsensitiveContains(search) ||
+            $0.artist.localizedCaseInsensitiveContains(search)
+        }
+    }
+
     var body: some View {
         NavigationStack {
-            List {
-                if store.songs.isEmpty {
-                    EmptyState(title: "Library is empty", message: "Use Import to add MP3, M4A, AAC, WAV, or FLAC files.", icon: "plus.circle")
-                } else {
-                    ForEach(filtered) { song in
-                        SongRow(song: song) { player.play(song, from: filtered) }
-                            .swipeActions {
-                                Button(role: .destructive) { store.delete(song) } label: {
-                                    Label("Delete", systemImage: "trash")
+            VStack(spacing: 0) {
+                Picker("Library", selection: $filter) {
+                    Text("Songs").tag(LibraryFilter.songs)
+                    Text("Artists").tag(LibraryFilter.artists)
+                    Text("Albums").tag(LibraryFilter.albums)
+                    Text("Favorites").tag(LibraryFilter.favorites)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .padding(.vertical, 10)
+
+                List {
+                    if store.songs.isEmpty {
+                        EmptyState(title: "Library is empty", message: "Use Import to add MP3, M4A, AAC, WAV, or FLAC files.", icon: "plus.circle")
+                    } else {
+                        switch filter {
+                        case .artists:
+                            ForEach(visibleArtistGroups) { group in
+                                NavigationLink {
+                                    ArtistDetailView(artist: group.name)
+                                } label: {
+                                    ArtistGroupRow(group: group)
                                 }
-                                Button { store.toggleFavorite(song) } label: {
-                                    Label("Favorite", systemImage: song.isFavorite ? "heart.slash" : "heart")
-                                }.tint(.pink)
                             }
+                        case .albums:
+                            ForEach(visibleAlbumGroups) { group in
+                                NavigationLink {
+                                    AlbumDetailView(group: group)
+                                } label: {
+                                    AlbumGroupRow(group: group)
+                                }
+                            }
+                        default:
+                            ForEach(filtered) { song in
+                                SongRow(song: song) { player.play(song, from: filtered) }
+                                    .swipeActions {
+                                        Button(role: .destructive) { store.delete(song) } label: {
+                                            Label("Delete", systemImage: "trash")
+                                        }
+                                        Button { store.toggleFavorite(song) } label: {
+                                            Label("Favorite", systemImage: song.isFavorite ? "heart.slash" : "heart")
+                                        }.tint(.pink)
+                                    }
+                            }
+                        }
                     }
                 }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
             .background(Color.ink)
             .navigationTitle("Your Library")
             .searchable(text: $search, prompt: "Songs, artists, albums")
@@ -243,6 +290,122 @@ struct PlaylistsView: View {
     }
 }
 
+struct ArtistGroupRow: View {
+    let group: ArtistGroup
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ArtworkView(song: group.representativeSong, size: 64)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(group.name).font(.headline)
+                Text("\(group.songs.count) songs")
+                    .font(.subheadline)
+                    .foregroundStyle(Color.muted)
+            }
+            Spacer()
+        }
+    }
+}
+
+struct AlbumGroupRow: View {
+    let group: AlbumGroup
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ArtworkView(song: group.representativeSong, size: 64)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(group.name).font(.headline)
+                Text(group.artist).font(.subheadline).foregroundStyle(Color.muted)
+                Text("\(group.songs.count) songs").font(.caption).foregroundStyle(Color.muted)
+            }
+            Spacer()
+        }
+    }
+}
+
+struct ArtistDetailView: View {
+    @EnvironmentObject private var store: MusicStore
+    @EnvironmentObject private var player: AudioPlayerService
+    let artist: String
+
+    private var songs: [Song] {
+        store.songs(forArtist: artist)
+    }
+
+    private var representativeSong: Song? {
+        songs.first(where: { $0.artworkData != nil }) ?? songs.first
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(spacing: 16) {
+                    ArtworkView(song: representativeSong, size: 112)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(artist).font(.title.bold())
+                        Text("\(songs.count) songs").foregroundStyle(Color.muted)
+                    }
+                }
+
+                HStack {
+                    Button {
+                        if let first = songs.first { player.play(first, from: songs) }
+                    } label: {
+                        Label("Play", systemImage: "play.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.lime)
+
+                    Button {
+                        let shuffled = songs.shuffled()
+                        if let first = shuffled.first {
+                            player.shuffle = true
+                            player.play(first, from: shuffled)
+                        }
+                    } label: {
+                        Label("Shuffle", systemImage: "shuffle").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                ForEach(songs) { song in
+                    SongRow(song: song) { player.play(song, from: songs) }
+                }
+            }
+            .padding(20)
+        }
+        .background(Color.ink)
+        .navigationTitle(artist)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+struct AlbumDetailView: View {
+    @EnvironmentObject private var player: AudioPlayerService
+    let group: AlbumGroup
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(spacing: 16) {
+                    ArtworkView(song: group.representativeSong, size: 112)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(group.name).font(.title2.bold())
+                        Text(group.artist).foregroundStyle(Color.muted)
+                    }
+                }
+                ForEach(group.songs) { song in
+                    SongRow(song: song) { player.play(song, from: group.songs) }
+                }
+            }
+            .padding(20)
+        }
+        .background(Color.ink)
+        .navigationTitle(group.name)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
 struct PlaylistDetail: View {
     @EnvironmentObject private var store: MusicStore
     @EnvironmentObject private var player: AudioPlayerService
@@ -311,6 +474,21 @@ struct SettingsView: View {
                     Button("Test MusicBrainz Connection") {
                         Task { await store.testMusicBrainzConnection() }
                     }
+                    Button("Fetch Missing Artwork") {
+                        Task { await store.fetchMissingArtwork() }
+                    }
+                    .disabled(store.isFetchingArtwork || store.songs.isEmpty)
+
+                    if store.isFetchingArtwork {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ProgressView()
+                            Text("Fetching artwork \(store.artworkFetchProgress) / \(store.artworkFetchTotal)")
+                        }
+                    } else if !store.artworkFetchSummary.isEmpty {
+                        Text(store.artworkFetchSummary)
+                            .foregroundStyle(Color.muted)
+                    }
+
                     Button("Rescan files") {
                         Task {
                             await store.rescanDocuments()

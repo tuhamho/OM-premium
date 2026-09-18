@@ -20,6 +20,10 @@ import UIKit
     @Published var debugLines: [String] = []
     @Published var isDebuggingSong = false
     @Published var showDebugPanel = false
+    @Published var isFetchingArtwork = false
+    @Published var artworkFetchProgress = 0
+    @Published var artworkFetchTotal = 0
+    @Published var artworkFetchSummary = ""
 
     private let stateURL: URL
     private let fm = FileManager.default
@@ -179,31 +183,62 @@ import UIKit
         let result = await ArtworkLookupService.shared.lookup(for: song)
         debugLines.append(contentsOf: result.logs)
 
-        guard let candidate = result.candidate else {
+        guard result.candidate != nil || result.artwork != nil else {
             debugLines.append("Song not changed")
             return
         }
 
+        await applyArtworkResult(result, for: song.id, preserveEmbeddedArtwork: hasEmbeddedArtwork)
+        debugLines.append("Song updated")
+        debugLines.append("Saved successfully")
+    }
+
+    func fetchMissingArtwork() async {
+        guard !isFetchingArtwork else { return }
+        let ids = songs.filter { $0.artworkData == nil }.map(\.id)
+        isFetchingArtwork = true
+        artworkFetchProgress = 0
+        artworkFetchTotal = ids.count
+        artworkFetchSummary = ""
+        var musicBrainzCount = 0
+        var appleCount = 0
+        var noneCount = 0
+
+        for id in ids {
+            guard let song = songs.first(where: { $0.id == id }) else { continue }
+            let result = await ArtworkLookupService.shared.lookup(for: song)
+            if result.artwork != nil {
+                if result.source == .musicBrainz { musicBrainzCount += 1 }
+                if result.source == .apple { appleCount += 1 }
+                await applyArtworkResult(result, for: id, preserveEmbeddedArtwork: false)
+            } else {
+                noneCount += 1
+            }
+            artworkFetchProgress += 1
+        }
+
+        isFetchingArtwork = false
+        artworkFetchSummary = "MusicBrainz artwork: \(musicBrainzCount) • Apple fallback: \(appleCount) • No artwork: \(noneCount)"
+    }
+
+    private func applyArtworkResult(_ result: ArtworkLookupResult, for id: UUID, preserveEmbeddedArtwork: Bool) async {
+        guard let index = songs.firstIndex(where: { $0.id == id }) else { return }
         var updated = songs[index]
-        if result.applyFilenameMetadata {
+        if result.applyFilenameMetadata, let candidate = result.candidate {
             updated.title = candidate.title
             updated.artist = candidate.artist
         }
         if updated.album == "Unknown Album", let album = result.album { updated.album = album }
         if result.applyFilenameMetadata, let albumArtist = result.albumArtist { updated.albumArtist = albumArtist }
         if updated.albumArtist.isEmpty || updated.albumArtist == "Unknown Artist", let albumArtist = result.albumArtist { updated.albumArtist = albumArtist }
-        if let artwork = result.artwork, !hasEmbeddedArtwork {
+        if let artwork = result.artwork, !preserveEmbeddedArtwork {
             await ArtworkCache.shared.store(artwork, for: updated.id.uuidString)
             updated.artworkData = artwork
-        } else if hasEmbeddedArtwork {
-            debugLines.append("Embedded artwork preserved")
         }
 
         songs[index] = updated
         objectWillChange.send()
-        debugLines.append("Song updated")
         save()
-        debugLines.append("Saved successfully")
         player?.syncCurrentSong(updated)
     }
 
@@ -241,6 +276,76 @@ import UIKit
         objectWillChange.send()
     }
     func song(_ id: UUID?) -> Song? { songs.first { $0.id == id } }
+    var artistGroups: [ArtistGroup] {
+        let grouped = Dictionary(grouping: songs) { artistKey(for: $0.displayArtist) }
+        return grouped.map { key, songs in
+            let sortedSongs = sortSongs(songs)
+            return ArtistGroup(
+                id: key,
+                name: displayArtistName(from: songs),
+                songs: sortedSongs
+            )
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    var albumGroups: [AlbumGroup] {
+        let grouped = Dictionary(grouping: songs) { song in
+            let artist = song.albumArtist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? song.displayArtist : song.albumArtist
+            return "\(artistKey(for: artist))\u{1F}\(albumKey(for: song.displayAlbum))"
+        }
+        return grouped.map { key, songs in
+            let first = songs[0]
+            let artist = first.albumArtist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? first.displayArtist : first.albumArtist
+            return AlbumGroup(
+                id: key,
+                name: displayAlbumName(from: songs),
+                artist: artist.trimmingCharacters(in: .whitespacesAndNewlines),
+                songs: sortSongs(songs)
+            )
+        }
+        .sorted {
+            let albumOrder = $0.name.localizedCaseInsensitiveCompare($1.name)
+            return albumOrder == .orderedSame
+                ? $0.artist.localizedCaseInsensitiveCompare($1.artist) == .orderedAscending
+                : albumOrder == .orderedAscending
+        }
+    }
+
+    func songs(forArtist name: String) -> [Song] {
+        let key = artistKey(for: name)
+        return sortSongs(songs.filter { artistKey(for: $0.displayArtist) == key })
+    }
+
+    private func artistKey(for value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let display = trimmed.isEmpty ? "Unknown Artist" : trimmed
+        return display.precomposedStringWithCanonicalMapping.lowercased(with: .current)
+    }
+
+    private func albumKey(for value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let display = trimmed.isEmpty ? "Unknown Album" : trimmed
+        return display.precomposedStringWithCanonicalMapping.lowercased(with: .current)
+    }
+
+    private func displayArtistName(from songs: [Song]) -> String {
+        let value = songs.first?.displayArtist.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? "Unknown Artist" : value
+    }
+
+    private func displayAlbumName(from songs: [Song]) -> String {
+        let value = songs.first?.displayAlbum.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? "Unknown Album" : value
+    }
+
+    private func sortSongs(_ values: [Song]) -> [Song] {
+        values.sorted {
+            let albumOrder = $0.displayAlbum.localizedCaseInsensitiveCompare($1.displayAlbum)
+            if albumOrder != .orderedSame { return albumOrder == .orderedAscending }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+    }
     func markPlayed(_ id: UUID) { update(id) { $0.playCount += 1; $0.lastPlayed = .now }; recentlyPlayed.removeAll { $0 == id }; recentlyPlayed.insert(id, at: 0); recentlyPlayed = Array(recentlyPlayed.prefix(30)); currentSongID = id; save() }
     func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; save() }
     func addPlaylist(name: String) { playlists.append(Playlist(name: name)); save() }
@@ -367,39 +472,52 @@ actor ArtworkLookupService {
         debugLogs = ["Searching MusicBrainz..."]
         guard song.title != "Unknown Title" else {
             debugLogs.append("No usable title")
-            return ArtworkLookupResult(candidate: nil, album: nil, albumArtist: nil, artwork: nil, applyFilenameMetadata: false, logs: debugLogs)
+            return ArtworkLookupResult(candidate: nil, album: nil, albumArtist: nil, artwork: nil, applyFilenameMetadata: false, source: .none, logs: debugLogs)
         }
-        guard let match = await matchingRelease(for: song) else {
-            debugLogs.append("No acceptable candidate")
-            return ArtworkLookupResult(candidate: nil, album: nil, albumArtist: nil, artwork: nil, applyFilenameMetadata: false, logs: debugLogs)
-        }
+        let match = await matchingRelease(for: song)
         var artwork: Data?
-        for releaseID in match.releaseIDs {
-            guard let url = URL(string: "https://coverartarchive.org/release/\(releaseID)/front-500") else { continue }
-            print("Cover Art Archive URL:", url.absoluteString)
-            debugLogs.append("Fetching cover art release \(releaseID)...")
-            debugLogs.append("Cover Art Archive URL: \(url.absoluteString)")
-            var request = URLRequest(url: url)
-            request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
-            do {
-                let (data, response) = try await URLSession.shared.data(for: request)
-                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-                print("Artwork HTTP status:", status)
-                debugLogs.append("Artwork HTTP status: \(status)")
-                if status == 200 {
-                    artwork = ArtworkCache.resizedArtwork(data)
-                    print("Artwork decoding:", artwork == nil ? "failed" : "succeeded")
-                    debugLogs.append(artwork == nil ? "Image decode failed" : "Artwork decoded")
-                    if artwork != nil { break }
+        if let match {
+            for releaseID in match.releaseIDs {
+                guard let url = URL(string: "https://coverartarchive.org/release/\(releaseID)/front-500") else { continue }
+                print("Cover Art Archive URL:", url.absoluteString)
+                debugLogs.append("Fetching cover art release \(releaseID)...")
+                debugLogs.append("Cover Art Archive URL: \(url.absoluteString)")
+                var request = URLRequest(url: url)
+                request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
+                do {
+                    let (data, response) = try await URLSession.shared.data(for: request)
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                    print("Artwork HTTP status:", status)
+                    debugLogs.append("Artwork HTTP status: \(status)")
+                    if status == 200 {
+                        artwork = ArtworkCache.resizedArtwork(data)
+                        print("Artwork decoding:", artwork == nil ? "failed" : "succeeded")
+                        debugLogs.append(artwork == nil ? "Image decode failed" : "Artwork decoded")
+                        if artwork != nil { break }
+                    }
+                } catch {
+                    print("Artwork lookup failed:", error)
+                    debugLogs.append("Cover Art Archive error: \(error.localizedDescription)")
                 }
-            } catch {
-                print("Artwork lookup failed:", error)
-                debugLogs.append("Cover Art Archive error: \(error.localizedDescription)")
             }
         }
-        if artwork == nil { debugLogs.append("No usable cover art found in checked releases") }
-        print("MusicBrainz selected recording score:", match.score, "candidate:", match.candidate.artist, "/", match.candidate.title)
-        return ArtworkLookupResult(candidate: match.candidate, album: match.album, albumArtist: match.albumArtist, artwork: artwork, applyFilenameMetadata: match.applyFilenameMetadata, logs: debugLogs)
+        if let match {
+            debugLogs.append(artwork == nil ? "MusicBrainz match found, artwork missing" : "MusicBrainz artwork found")
+            print("MusicBrainz selected recording score:", match.score, "candidate:", match.candidate.artist, "/", match.candidate.title)
+        } else {
+            debugLogs.append("No acceptable MusicBrainz candidate")
+        }
+
+        if artwork == nil {
+            if let apple = await AppleArtworkService.shared.lookup(for: song) {
+                artwork = apple.artwork
+                debugLogs.append(contentsOf: apple.logs)
+                return ArtworkLookupResult(candidate: match?.candidate, album: match?.album, albumArtist: match?.albumArtist, artwork: artwork, applyFilenameMetadata: match?.applyFilenameMetadata ?? false, source: .apple, logs: debugLogs)
+            }
+            debugLogs.append("Apple fallback found no confident artwork")
+        }
+
+        return ArtworkLookupResult(candidate: match?.candidate, album: match?.album, albumArtist: match?.albumArtist, artwork: artwork, applyFilenameMetadata: match?.applyFilenameMetadata ?? false, source: artwork == nil ? .none : .musicBrainz, logs: debugLogs)
     }
 
     func testConnection() async -> [String] {
@@ -548,7 +666,141 @@ struct ArtworkLookupResult {
     let albumArtist: String?
     let artwork: Data?
     let applyFilenameMetadata: Bool
+    let source: ArtworkSource
     let logs: [String]
+}
+
+enum ArtworkSource: Equatable {
+    case none
+    case musicBrainz
+    case apple
+}
+
+actor AppleArtworkService {
+    static let shared = AppleArtworkService()
+    private var lastRequest = Date.distantPast
+
+    func lookup(for song: Song) async -> AppleArtworkResult? {
+        let artist = song.artist == "Unknown Artist" ? "" : song.artist
+        let query = [artist, song.title].filter { !$0.isEmpty }.joined(separator: " ")
+        guard !query.isEmpty else { return nil }
+
+        var components = URLComponents(string: "https://itunes.apple.com/search")
+        components?.queryItems = [
+            URLQueryItem(name: "term", value: query),
+            URLQueryItem(name: "entity", value: "song"),
+            URLQueryItem(name: "limit", value: "10"),
+            URLQueryItem(name: "country", value: "VN")
+        ]
+        guard let url = components?.url else { return nil }
+
+        var logs = ["Apple fallback query: \(query)", "Apple request URL: \(url.absoluteString)"]
+        let wait = max(0, 1.0 - Date().timeIntervalSince(lastRequest))
+        if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+        lastRequest = Date()
+        var request = URLRequest(url: url)
+        request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            logs.append("Apple request failed: \(error.localizedDescription)")
+            print(logs.joined(separator: "\n"))
+            return nil
+        }
+
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        logs.append("Apple HTTP status: \(status)")
+        guard status == 200, let decoded = try? JSONDecoder().decode(AppleSearchResponse.self, from: data) else {
+            logs.append("Apple response could not be decoded")
+            print(logs.joined(separator: "\n"))
+            return nil
+        }
+        logs.append("Apple results: \(decoded.results.count)")
+
+        let expectedTitle = normalized(song.title)
+        let expectedArtist = normalized(artist)
+        let candidates = decoded.results.compactMap { result -> (AppleTrack, Double)? in
+            guard let resultTitle = result.trackName, let resultArtist = result.artistName else { return nil }
+            let titleScore = similarity(normalized(resultTitle), expectedTitle)
+            let artistScore = expectedArtist.isEmpty ? 1 : similarity(normalized(resultArtist), expectedArtist)
+            let durationScore: Double
+            if song.duration > 0, let milliseconds = result.trackTimeMillis {
+                let difference = abs(Double(milliseconds) / 1000 - song.duration)
+                durationScore = difference <= 5 ? 1 : max(0, 1 - difference / 60)
+            } else {
+                durationScore = 0.5
+            }
+            let confidence = titleScore * 0.55 + artistScore * 0.35 + durationScore * 0.10
+            return (result, confidence)
+        }
+        guard let best = candidates.max(by: { $0.1 < $1.1 }), best.1 >= 0.78 else {
+            logs.append("Apple result rejected: no confident match")
+            print(logs.joined(separator: "\n"))
+            return nil
+        }
+
+        let selected = best.0
+        let selectedTitle = selected.trackName ?? ""
+        let selectedArtist = selected.artistName ?? ""
+        logs.append("Apple selected: \(selectedTitle) — \(selectedArtist)")
+        logs.append(String(format: "Apple confidence: %.0f%%", best.1 * 100))
+        guard let artworkURL = selected.artworkURL else {
+            logs.append("Apple selected result has no artwork URL")
+            print(logs.joined(separator: "\n"))
+            return nil
+        }
+        logs.append("Apple artwork URL: \(artworkURL.absoluteString)")
+        do {
+            let (artworkData, artworkResponse) = try await URLSession.shared.data(from: artworkURL)
+            let artworkStatus = (artworkResponse as? HTTPURLResponse)?.statusCode ?? -1
+            logs.append("Apple artwork HTTP status: \(artworkStatus)")
+            guard artworkStatus == 200 else { return nil }
+            let resized = ArtworkCache.resizedArtwork(artworkData)
+            logs.append(resized == nil ? "Apple artwork decoding failed" : "Apple artwork downloaded")
+            print(logs.joined(separator: "\n"))
+            guard let resized else { return nil }
+            return AppleArtworkResult(artwork: resized, logs: logs)
+        } catch {
+            logs.append("Apple artwork download failed: \(error.localizedDescription)")
+            print(logs.joined(separator: "\n"))
+            return nil
+        }
+    }
+
+    private func normalized(_ value: String) -> String {
+        value.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .filter { $0.isLetter || $0.isNumber }
+    }
+
+    private func similarity(_ lhs: String, _ rhs: String) -> Double {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
+        if lhs == rhs { return 1 }
+        if lhs.contains(rhs) || rhs.contains(lhs) { return 0.9 }
+        return 0
+    }
+}
+
+struct AppleArtworkResult {
+    let artwork: Data
+    let logs: [String]
+}
+
+private struct AppleSearchResponse: Decodable {
+    let results: [AppleTrack]
+}
+
+private struct AppleTrack: Decodable {
+    let trackName: String?
+    let artistName: String?
+    let trackTimeMillis: Int?
+    let artworkUrl100: String?
+
+    var artworkURL: URL? {
+        guard let artworkUrl100 else { return nil }
+        return URL(string: artworkUrl100.replacingOccurrences(of: "100x100bb", with: "1200x1200bb"))
+    }
 }
 
 private struct MusicBrainzMatch {
