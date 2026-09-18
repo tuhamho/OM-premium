@@ -36,6 +36,16 @@ jobs:
           test -d "$APP_PATH"
           test -f "$EXECUTABLE_PATH"
 
+          echo "Verifying built Info.plist metadata"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" \
+            "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundlePackageType" \
+            "$APP_PATH/Info.plist"
+          BUILT_EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist")
+          BUILT_PACKAGE_TYPE=$(/usr/libexec/PlistBuddy -c "Print :CFBundlePackageType" "$APP_PATH/Info.plist")
+          test "$BUILT_EXECUTABLE" = "Offline Music"
+          test "$BUILT_PACKAGE_TYPE" = "APPL"
+
           echo "Signing: $APP_PATH"
           /usr/bin/codesign \
             --force \
