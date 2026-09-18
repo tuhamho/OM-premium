@@ -76,7 +76,15 @@ struct MetadataService {
         let items = try await asset.load(.commonMetadata)
         func value(_ identifier: AVMetadataIdentifier) -> String { items.first(where: { $0.identifier == identifier })?.stringValue ?? "" }
         let title = value(.commonIdentifierTitle).isEmpty ? URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent : value(.commonIdentifierTitle)
-        return Song(title: title, artist: value(.commonIdentifierArtist), album: value(.commonIdentifierAlbum), albumArtist: value(.commonIdentifierAlbumName), duration: duration.isFinite ? duration : 0, fileName: fileName, artworkData: items.first(where: { $0.commonKey == .commonKeyArtwork })?.dataValue)
+        return Song(
+        title: title,
+        artist: value(.commonIdentifierArtist),
+        album: value(.commonIdentifierAlbumName),
+        albumArtist: value(.commonIdentifierArtist),
+        duration: duration.isFinite ? duration : 0,
+        fileName: fileName,
+        artworkData: items.first(where: { $0.commonKey == .commonKeyArtwork })?.dataValue
+        )
     }
 }
 
