@@ -167,9 +167,13 @@ import UIKit
     private func enrichArtwork(for ids: [UUID]) async {
         for id in ids {
             guard let song = songs.first(where: { $0.id == id }), song.artworkData == nil else { continue }
-            guard let artwork = await ArtworkLookupService.shared.lookup(for: song) else { continue }
-            await ArtworkCache.shared.store(artwork, for: song.id.uuidString)
-            update(song.id) { $0.artworkData = artwork }
+            guard let result = await ArtworkLookupService.shared.lookup(for: song) else { continue }
+            if let artwork = result.artwork { await ArtworkCache.shared.store(artwork, for: song.id.uuidString) }
+            update(song.id) {
+                $0.artist = result.candidate.artist
+                $0.title = result.candidate.title
+                if let artwork = result.artwork { $0.artworkData = artwork }
+            }
             save()
         }
     }
@@ -220,7 +224,7 @@ struct MetadataService {
             }?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
 
-        let fallback = parseFilename(fileName)
+        let fallback = filenameCandidates(for: fileName).first ?? FilenameCandidate(artist: "Unknown Artist", title: "Unknown Title")
         let title = value(.commonIdentifierTitle).isEmpty ? fallback.title : value(.commonIdentifierTitle)
         let artist = value(.commonIdentifierArtist).isEmpty ? fallback.artist : value(.commonIdentifierArtist)
         let album = value(.commonIdentifierAlbumName).isEmpty ? "Unknown Album" : value(.commonIdentifierAlbumName)
@@ -240,26 +244,45 @@ struct MetadataService {
         )
     }
 
-    private static func parseFilename(_ fileName: String) -> (title: String, artist: String) {
+    static func filenameCandidates(for fileName: String) -> [FilenameCandidate] {
         var name = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
-        name = name.replacingOccurrences(of: #"\[[^\]]*\]|\([^\)]*\)"#, with: "", options: .regularExpression)
+        name = name.replacingOccurrences(of: #"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}-"#, with: "", options: .regularExpression)
+        name = name.replacingOccurrences(of: #"\[[^\]]*\]|\([^\)]*\)|\{[^\}]*\}"#, with: "", options: .regularExpression)
         name = name.replacingOccurrences(of: #"^\s*\d+\s*[-_.]\s*"#, with: "", options: .regularExpression)
         name = name.replacingOccurrences(of: #"(?i)\b(official\s+audio|official\s+video|lyric\s+video|lyrics|mv|audio|hd|4k)\b"#, with: "", options: .regularExpression)
-        name = name.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        name = trimFilenameJunk(name)
 
         let separators = [" - ", " – ", " — ", " | "]
         for separator in separators {
             if let range = name.range(of: separator) {
-                let artist = String(name[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let title = String(name[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !artist.isEmpty && !title.isEmpty {
-                    return (title, artist)
+                let first = trimFilenameJunk(String(name[..<range.lowerBound]))
+                let second = trimFilenameJunk(String(name[range.upperBound...]))
+                if !first.isEmpty && !second.isEmpty {
+                    return [
+                        FilenameCandidate(artist: first, title: second),
+                        FilenameCandidate(artist: second, title: first)
+                    ]
                 }
             }
         }
-        return (name.isEmpty ? "Unknown Title" : name, "Unknown Artist")
+        return [FilenameCandidate(artist: "Unknown Artist", title: name.isEmpty ? "Unknown Title" : name)]
     }
+
+    private static func trimFilenameJunk(_ value: String) -> String {
+        var result = value
+        result = result.replacingOccurrences(of: #"(?i)\b(official\s+audio|official\s+video|lyric\s+video|lyrics|mv|audio|video|hd|4k)\b"#, with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        result = result.replacingOccurrences(of: #"[|#_•:;]+$"#, with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"^[|#_•:;]+"#, with: "", options: .regularExpression)
+        return result.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+struct FilenameCandidate: Sendable {
+    let artist: String
+    let title: String
 }
 
 actor ArtworkCache {
@@ -295,20 +318,43 @@ actor ArtworkLookupService {
     static let shared = ArtworkLookupService()
     private var lastMusicBrainzRequest = Date.distantPast
 
-    func lookup(for song: Song) async -> Data? {
+    func lookup(for song: Song) async -> ArtworkLookupResult? {
         guard song.title != "Unknown Title" else { return nil }
-        guard let releaseID = await matchingReleaseID(for: song) else { return nil }
-        guard let url = URL(string: "https://coverartarchive.org/release/\(releaseID)/front-500") else { return nil }
-        var request = URLRequest(url: url)
-        request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        return ArtworkCache.resizedArtwork(data)
+        guard let match = await matchingRelease(for: song) else { return nil }
+        var artwork: Data?
+        if let url = URL(string: "https://coverartarchive.org/release/\(match.releaseID)/front-500") {
+            var request = URLRequest(url: url)
+            request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
+            if let (data, response) = try? await URLSession.shared.data(for: request),
+               (response as? HTTPURLResponse)?.statusCode == 200 {
+                artwork = ArtworkCache.resizedArtwork(data)
+            }
+        }
+        return ArtworkLookupResult(candidate: match.candidate, artwork: artwork)
     }
 
-    private func matchingReleaseID(for song: Song) async -> String? {
-        let artist = song.artist == "Unknown Artist" ? "" : song.artist
-        let query = artist.isEmpty ? "recording:\"\(song.title)\"" : "artist:\"\(artist)\" AND recording:\"\(song.title)\""
+    private func matchingRelease(for song: Song) async -> MusicBrainzMatch? {
+        let parsedCandidates = MetadataService.filenameCandidates(for: song.fileName)
+        let current = FilenameCandidate(artist: song.artist, title: song.title)
+        let candidates = parsedCandidates.count > 1 && parsedCandidates.contains(where: { normalized($0.artist) == normalized(current.artist) && normalized($0.title) == normalized(current.title) })
+            ? parsedCandidates
+            : [current]
+
+        var matches: [MusicBrainzMatch] = []
+        for candidate in candidates {
+            if let match = await searchMusicBrainz(for: candidate, duration: song.duration) {
+                matches.append(match)
+            }
+        }
+        guard let best = matches.max(by: { $0.confidence < $1.confidence }) else { return nil }
+        let secondBest = matches.filter { $0.candidate.artist != best.candidate.artist || $0.candidate.title != best.candidate.title }.max(by: { $0.confidence < $1.confidence })
+        guard secondBest == nil || best.confidence - secondBest!.confidence >= 12 else { return nil }
+        return best
+    }
+
+    private func searchMusicBrainz(for candidate: FilenameCandidate, duration: Double) async -> MusicBrainzMatch? {
+        let artist = candidate.artist == "Unknown Artist" ? "" : candidate.artist
+        let query = artist.isEmpty ? "recording:\"\(candidate.title)\"" : "artist:\"\(artist)\" AND recording:\"\(candidate.title)\""
         var components = URLComponents(string: "https://musicbrainz.org/ws/2/recording/")
         components?.queryItems = [
             URLQueryItem(name: "query", value: query),
@@ -327,24 +373,49 @@ actor ArtworkLookupService {
               (response as? HTTPURLResponse)?.statusCode == 200,
               let result = try? JSONDecoder().decode(MusicBrainzResponse.self, from: data) else { return nil }
 
-        let title = normalized(song.title)
-        let artist = normalized(song.artist)
+        let title = normalized(candidate.title)
+        let artist = normalized(candidate.artist)
         let matches = result.recordings
-            .filter { recording in
+            .compactMap { recording -> MusicBrainzMatch? in
                 let resultTitle = normalized(recording.title ?? "")
                 let resultArtist = normalized(recording.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: " ") ?? "")
-                let titleMatches = resultTitle == title || resultTitle.contains(title) || title.contains(resultTitle)
-                let artistMatches = artist == "unknownartist" || resultArtist.contains(artist) || artist.contains(resultArtist)
-                return (recording.score ?? 0) >= 90 && titleMatches && artistMatches
+                let titleSimilarity = similarity(resultTitle, title)
+                let artistSimilarity = artist == "unknownartist" ? 1 : similarity(resultArtist, artist)
+                guard (recording.score ?? 0) >= 90, titleSimilarity >= 0.8, artistSimilarity >= 0.8,
+                      let releaseID = recording.releases?.first?.id else { return nil }
+                var confidence = Double(recording.score ?? 0) + titleSimilarity * 20 + artistSimilarity * 20
+                if let length = recording.length, duration > 0 {
+                    let difference = abs(Double(length) / 1000 - duration)
+                    if difference <= 5 { confidence += 10 }
+                    if difference > 30 { confidence -= 10 }
+                }
+                return MusicBrainzMatch(candidate: candidate, releaseID: releaseID, confidence: confidence)
             }
-        guard matches.count == 1 else { return nil }
-        return matches[0].releases?.first?.id
+        return matches.max(by: { $0.confidence < $1.confidence })
+    }
+
+    private func similarity(_ lhs: String, _ rhs: String) -> Double {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
+        if lhs == rhs { return 1 }
+        if lhs.contains(rhs) || rhs.contains(lhs) { return 0.9 }
+        return 0
     }
 
     private func normalized(_ value: String) -> String {
         value.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
             .filter { $0.isLetter || $0.isNumber }
     }
+}
+
+struct ArtworkLookupResult {
+    let candidate: FilenameCandidate
+    let artwork: Data?
+}
+
+private struct MusicBrainzMatch {
+    let candidate: FilenameCandidate
+    let releaseID: String
+    let confidence: Double
 }
 
 private struct MusicBrainzResponse: Decodable {
@@ -354,12 +425,14 @@ private struct MusicBrainzResponse: Decodable {
 private struct MusicBrainzRecording: Decodable {
     let title: String?
     let score: Int?
+    let length: Int?
     let artistCredit: [MusicBrainzArtistCredit]?
     let releases: [MusicBrainzRelease]?
 
     enum CodingKeys: String, CodingKey {
         case title
         case score
+        case length
         case artistCredit = "artist-credit"
         case releases
     }
