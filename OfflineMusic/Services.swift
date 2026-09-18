@@ -170,8 +170,16 @@ import UIKit
             guard let result = await ArtworkLookupService.shared.lookup(for: song) else { continue }
             if let artwork = result.artwork { await ArtworkCache.shared.store(artwork, for: song.id.uuidString) }
             update(song.id) {
-                $0.artist = result.candidate.artist
-                $0.title = result.candidate.title
+                if result.applyFilenameMetadata {
+                    $0.artist = result.candidate.artist
+                    $0.title = result.candidate.title
+                }
+                if $0.album == "Unknown Album", let album = result.album { $0.album = album }
+                if result.applyFilenameMetadata, let albumArtist = result.albumArtist {
+                    $0.albumArtist = albumArtist
+                } else if ($0.albumArtist.isEmpty || $0.albumArtist == "Unknown Artist"), let albumArtist = result.albumArtist {
+                    $0.albumArtist = albumArtist
+                }
                 if let artwork = result.artwork { $0.artworkData = artwork }
             }
             save()
@@ -197,7 +205,11 @@ import UIKit
     }
 
     func toggleFavorite(_ song: Song) { update(song.id) { $0.isFavorite.toggle() }; save() }
-    func update(_ id: UUID, _ change: (inout Song) -> Void) { guard let i = songs.firstIndex(where: { $0.id == id }) else { return }; change(&songs[i]) }
+    func update(_ id: UUID, _ change: (inout Song) -> Void) {
+        guard let i = songs.firstIndex(where: { $0.id == id }) else { return }
+        change(&songs[i])
+        objectWillChange.send()
+    }
     func song(_ id: UUID?) -> Song? { songs.first { $0.id == id } }
     func markPlayed(_ id: UUID) { update(id) { $0.playCount += 1; $0.lastPlayed = .now }; recentlyPlayed.removeAll { $0 == id }; recentlyPlayed.insert(id, at: 0); recentlyPlayed = Array(recentlyPlayed.prefix(30)); currentSongID = id; save() }
     func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; save() }
@@ -249,7 +261,7 @@ struct MetadataService {
         name = name.replacingOccurrences(of: #"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}-"#, with: "", options: .regularExpression)
         name = name.replacingOccurrences(of: #"\[[^\]]*\]|\([^\)]*\)|\{[^\}]*\}"#, with: "", options: .regularExpression)
         name = name.replacingOccurrences(of: #"^\s*\d+\s*[-_.]\s*"#, with: "", options: .regularExpression)
-        name = name.replacingOccurrences(of: #"(?i)\b(official\s+audio|official\s+video|lyric\s+video|lyrics|mv|audio|hd|4k)\b"#, with: "", options: .regularExpression)
+        name = name.replacingOccurrences(of: #"(?i)\b(official\s+lyrics?\s+video|official\s+music\s+video|official\s+visuali[sz]er|official\s+mv|official\s+audio|official\s+video|visuali[sz]er|lyrics?|lyric\s+video|mv|audio|video|hd|4k)\b"#, with: "", options: .regularExpression)
         name = trimFilenameJunk(name)
 
         let separators = [" - ", " – ", " — ", " | "]
@@ -270,7 +282,7 @@ struct MetadataService {
 
     private static func trimFilenameJunk(_ value: String) -> String {
         var result = value
-        result = result.replacingOccurrences(of: #"(?i)\b(official\s+audio|official\s+video|lyric\s+video|lyrics|mv|audio|video|hd|4k)\b"#, with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"(?i)\b(official\s+lyrics?\s+video|official\s+music\s+video|official\s+visuali[sz]er|official\s+mv|official\s+audio|official\s+video|visuali[sz]er|lyrics?|lyric\s+video|mv|audio|video|hd|4k)\b"#, with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         result = result.replacingOccurrences(of: #"[|#_•:;]+$"#, with: "", options: .regularExpression)
@@ -300,7 +312,9 @@ actor ArtworkCache {
     }
 
     func store(_ data: Data, for key: String) {
-        try? data.write(to: directory.appendingPathComponent(key).appendingPathExtension("jpg"), options: .atomic)
+        let url = directory.appendingPathComponent(key).appendingPathExtension("jpg")
+        try? data.write(to: url, options: .atomic)
+        print("Artwork cache path:", url.path)
     }
 
     nonisolated static func resizedArtwork(_ data: Data?, maxDimension: CGFloat = 600) -> Data? {
@@ -322,23 +336,33 @@ actor ArtworkLookupService {
         guard song.title != "Unknown Title" else { return nil }
         guard let match = await matchingRelease(for: song) else { return nil }
         var artwork: Data?
-        if let url = URL(string: "https://coverartarchive.org/release/\(match.releaseID)/front-500") {
+        for releaseID in match.releaseIDs {
+            guard let url = URL(string: "https://coverartarchive.org/release/\(releaseID)/front-500") else { continue }
+            print("Cover Art Archive URL:", url.absoluteString)
             var request = URLRequest(url: url)
             request.setValue("OfflineMusic/1.0 (local music library)", forHTTPHeaderField: "User-Agent")
-            if let (data, response) = try? await URLSession.shared.data(for: request),
-               (response as? HTTPURLResponse)?.statusCode == 200 {
-                artwork = ArtworkCache.resizedArtwork(data)
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                print("Artwork HTTP status:", status)
+                if status == 200 {
+                    artwork = ArtworkCache.resizedArtwork(data)
+                    print("Artwork decoding:", artwork == nil ? "failed" : "succeeded")
+                    if artwork != nil { break }
+                }
+            } catch {
+                print("Artwork lookup failed:", error)
             }
         }
-        return ArtworkLookupResult(candidate: match.candidate, artwork: artwork)
+        print("MusicBrainz selected recording score:", match.score, "candidate:", match.candidate.artist, "/", match.candidate.title)
+        return ArtworkLookupResult(candidate: match.candidate, album: match.album, albumArtist: match.albumArtist, artwork: artwork, applyFilenameMetadata: match.applyFilenameMetadata)
     }
 
     private func matchingRelease(for song: Song) async -> MusicBrainzMatch? {
         let parsedCandidates = MetadataService.filenameCandidates(for: song.fileName)
         let current = FilenameCandidate(artist: song.artist, title: song.title)
-        let candidates = parsedCandidates.count > 1 && parsedCandidates.contains(where: { normalized($0.artist) == normalized(current.artist) && normalized($0.title) == normalized(current.title) })
-            ? parsedCandidates
-            : [current]
+        let filenameFallback = current.artist == "Unknown Artist" || parsedCandidates.contains(where: { normalized($0.artist) == normalized(current.artist) && normalized($0.title) == normalized(current.title) })
+        let candidates = filenameFallback ? parsedCandidates : [current]
 
         var matches: [MusicBrainzMatch] = []
         for candidate in candidates {
@@ -346,9 +370,11 @@ actor ArtworkLookupService {
                 matches.append(match)
             }
         }
-        guard let best = matches.max(by: { $0.confidence < $1.confidence }) else { return nil }
+        guard var best = matches.max(by: { $0.confidence < $1.confidence }) else { return nil }
         let secondBest = matches.filter { $0.candidate.artist != best.candidate.artist || $0.candidate.title != best.candidate.title }.max(by: { $0.confidence < $1.confidence })
         guard secondBest == nil || best.confidence - secondBest!.confidence >= 12 else { return nil }
+        print("MusicBrainz selected candidate:", best.candidate.artist, "/", best.candidate.title, "score:", best.score, "release IDs:", best.releaseIDs)
+        best.applyFilenameMetadata = filenameFallback
         return best
     }
 
@@ -382,14 +408,17 @@ actor ArtworkLookupService {
                 let titleSimilarity = similarity(resultTitle, title)
                 let artistSimilarity = normalizedArtist == "unknownartist" ? 1 : similarity(resultArtist, normalizedArtist)
                 guard (recording.score ?? 0) >= 90, titleSimilarity >= 0.8, artistSimilarity >= 0.8,
-                      let releaseID = recording.releases?.first?.id else { return nil }
+                      let release = recording.releases?.first else { return nil }
                 var confidence = Double(recording.score ?? 0) + titleSimilarity * 20 + artistSimilarity * 20
                 if let length = recording.length, duration > 0 {
                     let difference = abs(Double(length) / 1000 - duration)
                     if difference <= 5 { confidence += 10 }
                     if difference > 30 { confidence -= 10 }
                 }
-                return MusicBrainzMatch(candidate: candidate, releaseID: releaseID, confidence: confidence)
+                let releaseIDs = recording.releases?.compactMap(\.id) ?? []
+                print("MusicBrainz candidate:", candidate.artist, "/", candidate.title, "score:", recording.score ?? 0, "recording:", recording.title ?? "", "release IDs:", releaseIDs)
+                let albumArtist = release.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: " ")
+                return MusicBrainzMatch(candidate: candidate, releaseIDs: releaseIDs, score: recording.score ?? 0, confidence: confidence, album: release.title, albumArtist: albumArtist)
             }
         return matches.max(by: { $0.confidence < $1.confidence })
     }
@@ -409,13 +438,20 @@ actor ArtworkLookupService {
 
 struct ArtworkLookupResult {
     let candidate: FilenameCandidate
+    let album: String?
+    let albumArtist: String?
     let artwork: Data?
+    let applyFilenameMetadata: Bool
 }
 
 private struct MusicBrainzMatch {
     let candidate: FilenameCandidate
-    let releaseID: String
+    let releaseIDs: [String]
+    let score: Int
     let confidence: Double
+    let album: String?
+    let albumArtist: String?
+    var applyFilenameMetadata = false
 }
 
 private struct MusicBrainzResponse: Decodable {
@@ -449,6 +485,14 @@ private struct MusicBrainzArtist: Decodable {
 
 private struct MusicBrainzRelease: Decodable {
     let id: String
+    let title: String?
+    let artistCredit: [MusicBrainzArtistCredit]?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case artistCredit = "artist-credit"
+    }
 }
 
 @MainActor final class AudioPlayerService: ObservableObject {
