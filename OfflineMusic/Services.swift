@@ -463,9 +463,128 @@ actor ArtworkCache {
     }
 }
 
+enum MusicBrainzConfiguration {
+    static let userAgent = "OfflineMusic/1.0 (https://github.com/tuhamho/OM-premium)"
+}
+
+struct MusicBrainzHTTPResult {
+    let data: Data
+    let response: HTTPURLResponse?
+    let diagnostics: [String]
+    let errorDescription: String?
+}
+
+actor MusicBrainzRequestGate {
+    private var available = true
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if available {
+            available = false
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        if let waiter = waiters.first {
+            waiters.removeFirst()
+            waiter.resume()
+        } else {
+            available = true
+        }
+    }
+}
+
+actor MusicBrainzRequestScheduler {
+    static let shared = MusicBrainzRequestScheduler()
+
+    private let minimumStartInterval: TimeInterval = 1.15
+    private let requestGate = MusicBrainzRequestGate()
+    private var lastRequestStart = Date.distantPast
+    private var requestNumber = 0
+
+    func request(url: URL) async -> MusicBrainzHTTPResult {
+        await requestGate.acquire()
+        let result = await performRequest(url: url)
+        await requestGate.release()
+        return result
+    }
+
+    private func performRequest(url: URL) async -> MusicBrainzHTTPResult {
+        var diagnostics: [String] = []
+
+        for attempt in 1...5 {
+            let sincePrevious = Date().timeIntervalSince(lastRequestStart)
+            let throttleWait = max(0, minimumStartInterval - sincePrevious)
+            if throttleWait > 0 {
+                diagnostics.append(String(format: "Waiting for MusicBrainz throttle (%.2fs)...", throttleWait))
+                try? await Task.sleep(nanoseconds: UInt64(throttleWait * 1_000_000_000))
+            }
+
+            let elapsed = Date().timeIntervalSince(lastRequestStart)
+            requestNumber += 1
+            let currentRequestNumber = requestNumber
+            lastRequestStart = Date()
+            diagnostics.append("Request \(currentRequestNumber), attempt \(attempt)")
+            diagnostics.append(String(format: "Previous request: %.2fs ago", elapsed))
+
+            var request = URLRequest(url: url)
+            request.setValue(MusicBrainzConfiguration.userAgent, forHTTPHeaderField: "User-Agent")
+
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let httpResponse = response as? HTTPURLResponse
+                let status = httpResponse?.statusCode ?? -1
+                diagnostics.append("HTTP status: \(status)")
+
+                guard status == 503 || status == 429 else {
+                    return MusicBrainzHTTPResult(data: data, response: httpResponse, diagnostics: diagnostics, errorDescription: nil)
+                }
+
+                let retryAfter = retryAfterSeconds(from: httpResponse)
+                diagnostics.append(retryAfter.map { String(format: "Retry-After: %.2fs", $0) } ?? "Retry-After: none")
+                guard attempt < 5 else {
+                    let message = status == 503
+                        ? "MusicBrainz temporarily unavailable (HTTP 503)"
+                        : "MusicBrainz rate limited (HTTP 429)"
+                    diagnostics.append(message)
+                    return MusicBrainzHTTPResult(data: data, response: httpResponse, diagnostics: diagnostics, errorDescription: message)
+                }
+
+                let backoff = retryAfter ?? (pow(2.0, Double(attempt)) + Double.random(in: 0...0.25))
+                diagnostics.append(String(format: "Waiting %.2fs before retry...", backoff))
+                try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+            } catch {
+                let message = "MusicBrainz network error: \(error.localizedDescription)"
+                diagnostics.append(message)
+                return MusicBrainzHTTPResult(data: Data(), response: nil, diagnostics: diagnostics, errorDescription: message)
+            }
+        }
+
+        let message = "MusicBrainz request ended without a response"
+        diagnostics.append(message)
+        return MusicBrainzHTTPResult(data: Data(), response: nil, diagnostics: diagnostics, errorDescription: message)
+    }
+
+    private func retryAfterSeconds(from response: HTTPURLResponse?) -> TimeInterval? {
+        guard let value = response?.value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        if let seconds = Double(value) { return max(0, seconds) }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss z"
+        guard let date = formatter.date(from: value) else { return nil }
+        return max(0, date.timeIntervalSinceNow)
+    }
+}
+
 actor ArtworkLookupService {
     static let shared = ArtworkLookupService()
-    private var lastMusicBrainzRequest = Date.distantPast
     private var debugLogs: [String] = []
 
     func lookup(for song: Song) async -> ArtworkLookupResult {
@@ -474,7 +593,8 @@ actor ArtworkLookupService {
             debugLogs.append("No usable title")
             return ArtworkLookupResult(candidate: nil, album: nil, albumArtist: nil, artwork: nil, applyFilenameMetadata: false, source: .none, logs: debugLogs)
         }
-        let match = await matchingRelease(for: song)
+        let lookup = await matchingRelease(for: song)
+        let match = lookup.match
         var artwork: Data?
         if let match {
             for releaseID in match.releaseIDs {
@@ -508,13 +628,15 @@ actor ArtworkLookupService {
             debugLogs.append("No acceptable MusicBrainz candidate")
         }
 
-        if artwork == nil {
+        if artwork == nil && lookup.canUseAppleFallback {
             if let apple = await AppleArtworkService.shared.lookup(for: song) {
                 artwork = apple.artwork
                 debugLogs.append(contentsOf: apple.logs)
                 return ArtworkLookupResult(candidate: match?.candidate, album: match?.album, albumArtist: match?.albumArtist, artwork: artwork, applyFilenameMetadata: match?.applyFilenameMetadata ?? false, source: .apple, logs: debugLogs)
             }
             debugLogs.append("Apple fallback found no confident artwork")
+        } else if artwork == nil {
+            debugLogs.append("Apple fallback skipped because MusicBrainz was temporarily unavailable")
         }
 
         return ArtworkLookupResult(candidate: match?.candidate, album: match?.album, albumArtist: match?.albumArtist, artwork: artwork, applyFilenameMetadata: match?.applyFilenameMetadata ?? false, source: artwork == nil ? .none : .musicBrainz, logs: debugLogs)
@@ -525,35 +647,45 @@ actor ArtworkLookupService {
         var components = URLComponents(string: "https://musicbrainz.org/ws/2/recording/")
         components?.queryItems = [URLQueryItem(name: "query", value: query), URLQueryItem(name: "fmt", value: "json"), URLQueryItem(name: "limit", value: "1")]
         guard let url = components?.url else { return ["Could not create test URL"] }
-        let userAgent = "OfflineMusic/1.0 (local music library)"
-        var request = URLRequest(url: url)
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-            let decoded = (try? JSONDecoder().decode(MusicBrainzResponse.self, from: data)) != nil
-            let decodedText = decoded ? "yes" : "no"
-            return ["Request URL: \(url.absoluteString)", "User-Agent sent: \(userAgent)", "HTTP status: \(status)", "Response received: yes (\(data.count) bytes)", "JSON decoded: \(decodedText)"]
-        } catch {
-            return ["Request URL: \(url.absoluteString)", "User-Agent sent: \(userAgent)", "Response received: no", "Network error: \(error.localizedDescription)"]
+        let result = await MusicBrainzRequestScheduler.shared.request(url: url)
+        var lines = ["Request URL: \(url.absoluteString)", "User-Agent sent: \(MusicBrainzConfiguration.userAgent)"]
+        lines.append(contentsOf: result.diagnostics)
+        let status = result.response?.statusCode ?? -1
+        lines.append("HTTP status: \(status)")
+        guard (200...299).contains(status) else {
+            lines.append(result.errorDescription ?? "MusicBrainz request failed (HTTP \(status))")
+            let responseReceived = result.response == nil ? "no" : "yes"
+            lines.append("Response received: \(responseReceived)")
+            return lines
         }
+        let decoded = try? JSONDecoder().decode(MusicBrainzResponse.self, from: result.data)
+        lines.append("Response received: yes (\(result.data.count) bytes)")
+        let decodedText = decoded == nil ? "no" : "yes"
+        lines.append("JSON decoded: \(decodedText)")
+        if let decoded {
+            lines.append("Recordings returned: \(decoded.recordings.count)")
+        }
+        return lines
     }
 
-    private func matchingRelease(for song: Song) async -> MusicBrainzMatch? {
+    private func matchingRelease(for song: Song) async -> MusicBrainzLookupResult {
         let parsedCandidates = MetadataService.filenameCandidates(for: song.fileName)
         let current = FilenameCandidate(artist: song.artist, title: song.title)
         let filenameFallback = current.artist == "Unknown Artist" || parsedCandidates.contains(where: { normalized($0.artist) == normalized(current.artist) && normalized($0.title) == normalized(current.title) })
         let candidates = filenameFallback ? parsedCandidates : [current]
 
         var matches: [MusicBrainzMatch] = []
+        var receivedSuccessfulResponse = false
         for candidate in candidates {
-            if let match = await searchMusicBrainz(for: candidate, duration: song.duration) {
+            let result = await searchMusicBrainz(for: candidate, duration: song.duration)
+            receivedSuccessfulResponse = receivedSuccessfulResponse || result.receivedSuccessfulResponse
+            if let match = result.match {
                 matches.append(match)
             }
         }
         guard var best = matches.max(by: { $0.confidence < $1.confidence }) else {
             debugLogs.append("No MusicBrainz candidate passed the confidence threshold")
-            return nil
+            return MusicBrainzLookupResult(match: nil, canUseAppleFallback: receivedSuccessfulResponse)
         }
         let secondBest = matches.filter { $0.candidate.artist != best.candidate.artist || $0.candidate.title != best.candidate.title }.max(by: { $0.confidence < $1.confidence })
         if let secondBest {
@@ -563,17 +695,17 @@ actor ArtworkLookupService {
         }
         guard secondBest == nil || best.confidence - secondBest!.confidence >= 12 else {
             debugLogs.append("Result rejected: candidates were too close")
-            return nil
+            return MusicBrainzLookupResult(match: nil, canUseAppleFallback: receivedSuccessfulResponse)
         }
         print("MusicBrainz selected candidate:", best.candidate.artist, "/", best.candidate.title, "score:", best.score, "release IDs:", best.releaseIDs)
         debugLogs.append("Selected: \(best.candidate.artist) - \(best.candidate.title)")
         let releaseList = best.releaseIDs.joined(separator: ", ")
         debugLogs.append("Release IDs: \(releaseList)")
         best.applyFilenameMetadata = filenameFallback
-        return best
+        return MusicBrainzLookupResult(match: best, canUseAppleFallback: receivedSuccessfulResponse)
     }
 
-    private func searchMusicBrainz(for candidate: FilenameCandidate, duration: Double) async -> MusicBrainzMatch? {
+    private func searchMusicBrainz(for candidate: FilenameCandidate, duration: Double) async -> MusicBrainzSearchResult {
         let artist = candidate.artist == "Unknown Artist" ? "" : candidate.artist
         let query = artist.isEmpty ? "recording:\"\(candidate.title)\"" : "artist:\"\(artist)\" AND recording:\"\(candidate.title)\""
         var components = URLComponents(string: "https://musicbrainz.org/ws/2/recording/")
@@ -582,33 +714,32 @@ actor ArtworkLookupService {
             URLQueryItem(name: "fmt", value: "json"),
             URLQueryItem(name: "limit", value: "5")
         ]
-        guard let url = components?.url else { return nil }
-
-        let wait = max(0, 1.0 - Date().timeIntervalSince(lastMusicBrainzRequest))
-        if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
-        lastMusicBrainzRequest = Date()
-
-        var request = URLRequest(url: url)
-        let userAgent = "OfflineMusic/1.0 (local music library)"
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        debugLogs.append("MusicBrainz request URL: \(url.absoluteString)")
-        debugLogs.append("User-Agent sent: \(userAgent)")
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await URLSession.shared.data(for: request)
-        } catch {
-            debugLogs.append("MusicBrainz network error: \(error.localizedDescription)")
-            return nil
+        guard let url = components?.url else {
+            return MusicBrainzSearchResult(match: nil, receivedSuccessfulResponse: false)
         }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        debugLogs.append("MusicBrainz HTTP status: \(status)")
-        debugLogs.append("MusicBrainz response bytes: \(data.count)")
-        guard status == 200 else { return nil }
+
+        debugLogs.append("MusicBrainz request URL: \(url.absoluteString)")
+        debugLogs.append("User-Agent sent: \(MusicBrainzConfiguration.userAgent)")
+
+        let response = await MusicBrainzRequestScheduler.shared.request(url: url)
+        debugLogs.append(contentsOf: response.diagnostics)
+        let status = response.response?.statusCode ?? -1
+        debugLogs.append("MusicBrainz response bytes: \(response.data.count)")
+        guard (200...299).contains(status) else {
+            if let errorDescription = response.errorDescription {
+                debugLogs.append(errorDescription)
+            } else {
+                debugLogs.append("MusicBrainz request failed (HTTP \(status))")
+            }
+            return MusicBrainzSearchResult(
+                match: nil,
+                receivedSuccessfulResponse: false
+            )
+        }
+        let data = response.data
         guard let result = try? JSONDecoder().decode(MusicBrainzResponse.self, from: data) else {
             debugLogs.append("MusicBrainz JSON decode failed")
-            return nil
+            return MusicBrainzSearchResult(match: nil, receivedSuccessfulResponse: true)
         }
         debugLogs.append("MusicBrainz recordings returned: \(result.recordings.count)")
         if let highestScore = result.recordings.compactMap(\.score).max(), highestScore < 90 {
@@ -644,7 +775,10 @@ actor ArtworkLookupService {
                 let albumArtist = release.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: " ")
                 return MusicBrainzMatch(candidate: candidate, releaseIDs: releaseIDs, score: recording.score ?? 0, confidence: confidence, album: release.title, albumArtist: albumArtist)
             }
-        return matches.max(by: { $0.confidence < $1.confidence })
+        return MusicBrainzSearchResult(
+            match: matches.max(by: { $0.confidence < $1.confidence }),
+            receivedSuccessfulResponse: true
+        )
     }
 
     private func similarity(_ lhs: String, _ rhs: String) -> Double {
@@ -668,6 +802,16 @@ struct ArtworkLookupResult {
     let applyFilenameMetadata: Bool
     let source: ArtworkSource
     let logs: [String]
+}
+
+private struct MusicBrainzSearchResult {
+    let match: MusicBrainzMatch?
+    let receivedSuccessfulResponse: Bool
+}
+
+private struct MusicBrainzLookupResult {
+    let match: MusicBrainzMatch?
+    let canUseAppleFallback: Bool
 }
 
 enum ArtworkSource: Equatable {
