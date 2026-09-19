@@ -24,10 +24,13 @@ import UIKit
     @Published var artworkFetchProgress = 0
     @Published var artworkFetchTotal = 0
     @Published var artworkFetchSummary = ""
+    @Published var enrichmentCurrentSong = ""
+    @Published var enrichmentStatus = ""
 
     private let stateURL: URL
     private let fm = FileManager.default
     private weak var player: AudioPlayerService?
+    private var enrichmentRunID = UUID()
 
     init() {
         let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -188,42 +191,98 @@ import UIKit
             return
         }
 
-        await applyArtworkResult(result, for: song.id, preserveEmbeddedArtwork: hasEmbeddedArtwork)
+        _ = await applyArtworkResult(result, for: song.id, preserveExistingArtwork: hasEmbeddedArtwork)
         debugLines.append("Song updated")
         debugLines.append("Saved successfully")
     }
 
-    func fetchMissingArtwork() async {
+    func startMetadataArtworkEnrichment() {
         guard !isFetchingArtwork else { return }
-        let ids = songs.filter { $0.artworkData == nil }.map(\.id)
+        let ids = songs.filter { needsEnrichment($0) }.map(\.id)
         isFetchingArtwork = true
         artworkFetchProgress = 0
         artworkFetchTotal = ids.count
         artworkFetchSummary = ""
-        var musicBrainzCount = 0
-        var appleCount = 0
-        var noneCount = 0
-
-        for id in ids {
-            guard let song = songs.first(where: { $0.id == id }) else { continue }
-            let result = await ArtworkLookupService.shared.lookup(for: song)
-            if result.artwork != nil {
-                if result.source == .musicBrainz { musicBrainzCount += 1 }
-                if result.source == .apple { appleCount += 1 }
-                await applyArtworkResult(result, for: id, preserveEmbeddedArtwork: false)
-            } else {
-                noneCount += 1
-            }
-            artworkFetchProgress += 1
+        enrichmentCurrentSong = ""
+        enrichmentStatus = "Queued"
+        let runID = UUID()
+        enrichmentRunID = runID
+        Task { @MainActor [weak self] in
+            await self?.runMetadataArtworkEnrichment(ids: ids, runID: runID)
         }
-
-        isFetchingArtwork = false
-        artworkFetchSummary = "MusicBrainz artwork: \(musicBrainzCount) • Apple fallback: \(appleCount) • No artwork: \(noneCount)"
     }
 
-    private func applyArtworkResult(_ result: ArtworkLookupResult, for id: UUID, preserveEmbeddedArtwork: Bool) async {
-        guard let index = songs.firstIndex(where: { $0.id == id }) else { return }
+    func cancelMetadataArtworkEnrichment() {
+        guard isFetchingArtwork else { return }
+        enrichmentStatus = "Cancelled"
+        enrichmentRunID = UUID()
+        isFetchingArtwork = false
+        artworkFetchSummary = "Enrichment cancelled"
+    }
+
+    private func runMetadataArtworkEnrichment(ids: [UUID], runID: UUID) async {
+        var metadataUpdated = 0
+        var embeddedArtwork = 0
+        var musicBrainzArtwork = 0
+        var appleArtwork = 0
+        var needsReview = 0
+        var notFound = 0
+        var failed = 0
+
+        for id in ids {
+            guard isFetchingArtwork, enrichmentRunID == runID, let song = songs.first(where: { $0.id == id }) else { break }
+            artworkFetchProgress += 1
+            enrichmentCurrentSong = "\(song.displayArtist) - \(song.title)"
+            enrichmentStatus = "MusicBrainz match"
+
+            if song.artworkData != nil {
+                let url = documentURL(for: song.fileName)
+                if await MetadataService.hasEmbeddedArtwork(asset: AVURLAsset(url: url)) {
+                    embeddedArtwork += 1
+                }
+            }
+            let result = await ArtworkLookupService.shared.lookup(for: song)
+            guard isFetchingArtwork, enrichmentRunID == runID else { break }
+
+            enrichmentStatus = "Fetching artwork"
+            let update = await applyArtworkResult(
+                result,
+                for: id,
+                preserveExistingArtwork: song.artworkData != nil
+            )
+            if update.metadataChanged { metadataUpdated += 1 }
+            if result.source == .musicBrainz && update.artworkApplied { musicBrainzArtwork += 1 }
+            if result.source == .apple && update.artworkApplied { appleArtwork += 1 }
+
+            if result.logs.contains(where: { $0.localizedCaseInsensitiveContains("temporarily unavailable") || $0.localizedCaseInsensitiveContains("network error") }) {
+                failed += 1
+            } else if result.candidate == nil && result.artwork == nil {
+                needsReview += 1
+            } else if result.artwork == nil && !update.metadataChanged {
+                notFound += 1
+            }
+            enrichmentStatus = "Done"
+        }
+
+        guard enrichmentRunID == runID else { return }
+        let wasCancelled = !isFetchingArtwork
+        isFetchingArtwork = false
+        enrichmentStatus = wasCancelled ? "Cancelled" : "Complete"
+        artworkFetchSummary = "Metadata updated: \(metadataUpdated) • Artwork from embedded tags: \(embeddedArtwork) • Artwork from MusicBrainz: \(musicBrainzArtwork) • Artwork from Apple fallback: \(appleArtwork) • Needs review: \(needsReview) • Not found: \(notFound) • Failed: \(failed)"
+    }
+
+    private func needsEnrichment(_ song: Song) -> Bool {
+        let artist = song.displayArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = song.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let goodArtist = !artist.isEmpty && artist.caseInsensitiveCompare("Unknown Artist") != .orderedSame
+        let goodTitle = !title.isEmpty && title.caseInsensitiveCompare("Unknown Title") != .orderedSame
+        return !goodArtist || !goodTitle || song.artworkData == nil
+    }
+
+    private func applyArtworkResult(_ result: ArtworkLookupResult, for id: UUID, preserveExistingArtwork: Bool) async -> (metadataChanged: Bool, artworkApplied: Bool) {
+        guard let index = songs.firstIndex(where: { $0.id == id }) else { return (false, false) }
         var updated = songs[index]
+        let original = updated
         if result.applyFilenameMetadata, let candidate = result.candidate {
             updated.title = candidate.title
             updated.artist = candidate.artist
@@ -231,15 +290,18 @@ import UIKit
         if updated.album == "Unknown Album", let album = result.album { updated.album = album }
         if result.applyFilenameMetadata, let albumArtist = result.albumArtist { updated.albumArtist = albumArtist }
         if updated.albumArtist.isEmpty || updated.albumArtist == "Unknown Artist", let albumArtist = result.albumArtist { updated.albumArtist = albumArtist }
-        if let artwork = result.artwork, !preserveEmbeddedArtwork {
+        var artworkApplied = false
+        if let artwork = result.artwork, !preserveExistingArtwork {
             await ArtworkCache.shared.store(artwork, for: updated.id.uuidString)
             updated.artworkData = artwork
+            artworkApplied = true
         }
 
         songs[index] = updated
         objectWillChange.send()
         save()
         player?.syncCurrentSong(updated)
+        return (updated.title != original.title || updated.artist != original.artist || updated.album != original.album || updated.albumArtist != original.albumArtist, artworkApplied)
     }
 
     func testMusicBrainzConnection() async {
@@ -355,6 +417,14 @@ import UIKit
 private struct PersistedState: Codable { var songs: [Song]; var playlists: [Playlist]; var recentlyPlayed: [UUID]; var currentSongID: UUID?; var savedPosition: Double }
 
 struct MetadataService {
+    static func hasEmbeddedArtwork(asset: AVURLAsset) async -> Bool {
+        guard let items = try? await asset.load(.metadata),
+              let commonItems = try? await asset.load(.commonMetadata) else { return false }
+        return (items + commonItems).contains {
+            $0.commonKey == .commonKeyArtwork || ($0.identifier?.rawValue.localizedCaseInsensitiveContains("artwork") == true)
+        }
+    }
+
     static func read(asset: AVURLAsset, fileName: String) async throws -> Song {
         let duration = try await asset.load(.duration).seconds
         let commonItems = try await asset.load(.commonMetadata)
@@ -503,7 +573,7 @@ actor MusicBrainzRequestScheduler {
 
     private let minimumStartInterval: TimeInterval = 1.15
     private let requestGate = MusicBrainzRequestGate()
-    private var lastRequestStart = Date.distantPast
+    private var lastRequestStart: Date?
     private var requestNumber = 0
 
     func request(url: URL) async -> MusicBrainzHTTPResult {
@@ -517,19 +587,22 @@ actor MusicBrainzRequestScheduler {
         var diagnostics: [String] = []
 
         for attempt in 1...5 {
-            let sincePrevious = Date().timeIntervalSince(lastRequestStart)
-            let throttleWait = max(0, minimumStartInterval - sincePrevious)
+            let sincePrevious = lastRequestStart.map { Date().timeIntervalSince($0) }
+            let throttleWait = sincePrevious.map { max(0, minimumStartInterval - $0) } ?? 0
             if throttleWait > 0 {
                 diagnostics.append(String(format: "Waiting for MusicBrainz throttle (%.2fs)...", throttleWait))
                 try? await Task.sleep(nanoseconds: UInt64(throttleWait * 1_000_000_000))
             }
 
-            let elapsed = Date().timeIntervalSince(lastRequestStart)
             requestNumber += 1
             let currentRequestNumber = requestNumber
             lastRequestStart = Date()
             diagnostics.append("Request \(currentRequestNumber), attempt \(attempt)")
-            diagnostics.append(String(format: "Previous request: %.2fs ago", elapsed))
+            if let sincePrevious {
+                diagnostics.append(String(format: "Previous request: %.2fs ago", sincePrevious))
+            } else {
+                diagnostics.append("Previous request: none")
+            }
 
             var request = URLRequest(url: url)
             request.setValue(MusicBrainzConfiguration.userAgent, forHTTPHeaderField: "User-Agent")
@@ -559,6 +632,7 @@ actor MusicBrainzRequestScheduler {
                 try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
             } catch {
                 let message = "MusicBrainz network error: \(error.localizedDescription)"
+                diagnostics.append("HTTP status: unavailable")
                 diagnostics.append(message)
                 return MusicBrainzHTTPResult(data: Data(), response: nil, diagnostics: diagnostics, errorDescription: message)
             }
@@ -651,7 +725,6 @@ actor ArtworkLookupService {
         var lines = ["Request URL: \(url.absoluteString)", "User-Agent sent: \(MusicBrainzConfiguration.userAgent)"]
         lines.append(contentsOf: result.diagnostics)
         let status = result.response?.statusCode ?? -1
-        lines.append("HTTP status: \(status)")
         guard (200...299).contains(status) else {
             lines.append(result.errorDescription ?? "MusicBrainz request failed (HTTP \(status))")
             let responseReceived = result.response == nil ? "no" : "yes"

@@ -474,15 +474,23 @@ struct SettingsView: View {
                     Button("Test MusicBrainz Connection") {
                         Task { await store.testMusicBrainzConnection() }
                     }
-                    Button("Fetch Missing Artwork") {
-                        Task { await store.fetchMissingArtwork() }
+                    Button("Fetch Missing Metadata & Artwork") {
+                        store.startMetadataArtworkEnrichment()
                     }
                     .disabled(store.isFetchingArtwork || store.songs.isEmpty)
 
                     if store.isFetchingArtwork {
                         VStack(alignment: .leading, spacing: 6) {
                             ProgressView()
-                            Text("Fetching artwork \(store.artworkFetchProgress) / \(store.artworkFetchTotal)")
+                            Text("Processing \(store.artworkFetchProgress) / \(store.artworkFetchTotal)")
+                            if !store.enrichmentCurrentSong.isEmpty {
+                                Text("Current song: \(store.enrichmentCurrentSong)")
+                            }
+                            Text("Status: \(store.enrichmentStatus)")
+                                .foregroundStyle(Color.muted)
+                            Button("Cancel") {
+                                store.cancelMetadataArtworkEnrichment()
+                            }
                         }
                     } else if !store.artworkFetchSummary.isEmpty {
                         Text(store.artworkFetchSummary)
