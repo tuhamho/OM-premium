@@ -62,13 +62,26 @@ import UIKit
     func load() async {
         guard let data = try? Data(contentsOf: stateURL), let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
         songs = state.songs; playlists = state.playlists; recentlyPlayed = state.recentlyPlayed; currentSongID = state.currentSongID; savedPosition = state.savedPosition
+        let needsArtworkMigration = state.artworkMatchingVersion != ArtworkMatchingConfiguration.version
+        if needsArtworkMigration {
+            for index in songs.indices where songs[index].artworkData != nil {
+                let url = documentURL(for: songs[index].fileName)
+                let hasEmbedded = await MetadataService.hasEmbeddedArtwork(asset: AVURLAsset(url: url))
+                if !hasEmbedded {
+                    songs[index].artworkData = nil
+                } else if let artwork = songs[index].artworkData {
+                    await ArtworkCache.shared.store(artwork, for: songs[index].id.uuidString)
+                }
+            }
+            save()
+        }
         for index in songs.indices where songs[index].artworkData == nil {
             songs[index].artworkData = await ArtworkCache.shared.data(for: songs[index].id.uuidString)
         }
     }
 
     func save() {
-        let state = PersistedState(songs: songs, playlists: playlists, recentlyPlayed: recentlyPlayed, currentSongID: currentSongID, savedPosition: savedPosition)
+        let state = PersistedState(songs: songs, playlists: playlists, recentlyPlayed: recentlyPlayed, currentSongID: currentSongID, savedPosition: savedPosition, artworkMatchingVersion: ArtworkMatchingConfiguration.version)
         if let data = try? JSONEncoder().encode(state) { try? data.write(to: stateURL, options: .atomic) }
     }
 
@@ -154,6 +167,7 @@ import UIKit
                     metadata.lastPlayed = existing.lastPlayed
                     metadata.playCount = existing.playCount
                     metadata.isFavorite = existing.isFavorite
+                    metadata.musicBrainzReleaseID = existing.musicBrainzReleaseID
                     if metadata.artworkData == nil { metadata.artworkData = existing.artworkData }
                     songs[index] = metadata
                 } else {
@@ -221,6 +235,7 @@ import UIKit
     }
 
     private func runMetadataArtworkEnrichment(ids: [UUID], runID: UUID) async {
+        var processed = 0
         var metadataUpdated = 0
         var embeddedArtwork = 0
         var musicBrainzArtwork = 0
@@ -231,6 +246,7 @@ import UIKit
 
         for id in ids {
             guard isFetchingArtwork, enrichmentRunID == runID, let song = songs.first(where: { $0.id == id }) else { break }
+            processed += 1
             artworkFetchProgress += 1
             enrichmentCurrentSong = "\(song.displayArtist) - \(song.title)"
             enrichmentStatus = "MusicBrainz match"
@@ -268,7 +284,7 @@ import UIKit
         let wasCancelled = !isFetchingArtwork
         isFetchingArtwork = false
         enrichmentStatus = wasCancelled ? "Cancelled" : "Complete"
-        artworkFetchSummary = "Metadata updated: \(metadataUpdated) • Artwork from embedded tags: \(embeddedArtwork) • Artwork from MusicBrainz: \(musicBrainzArtwork) • Artwork from Apple fallback: \(appleArtwork) • Needs review: \(needsReview) • Not found: \(notFound) • Failed: \(failed)"
+        artworkFetchSummary = "Processed: \(processed) • Metadata updated: \(metadataUpdated) • Artwork from embedded tags: \(embeddedArtwork) • Artwork from MusicBrainz: \(musicBrainzArtwork) • Artwork from Apple fallback: \(appleArtwork) • Needs review: \(needsReview) • Not found: \(notFound) • Failed: \(failed)"
     }
 
     private func needsEnrichment(_ song: Song) -> Bool {
@@ -276,7 +292,16 @@ import UIKit
         let title = song.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let goodArtist = !artist.isEmpty && artist.caseInsensitiveCompare("Unknown Artist") != .orderedSame
         let goodTitle = !title.isEmpty && title.caseInsensitiveCompare("Unknown Title") != .orderedSame
-        return !goodArtist || !goodTitle || song.artworkData == nil
+        let filenameDerivedAndReversed = MetadataService.filenameCandidates(for: song.fileName).first.map {
+            normalizedMetadata(song.artist) == normalizedMetadata($0.title) && normalizedMetadata(song.title) == normalizedMetadata($0.artist)
+        } ?? false
+        return !goodArtist || !goodTitle || song.artworkData == nil || filenameDerivedAndReversed
+    }
+
+    private func normalizedMetadata(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
     }
 
     private func applyArtworkResult(_ result: ArtworkLookupResult, for id: UUID, preserveExistingArtwork: Bool) async -> (metadataChanged: Bool, artworkApplied: Bool) {
@@ -288,6 +313,11 @@ import UIKit
             updated.artist = candidate.artist
         }
         if updated.album == "Unknown Album", let album = result.album { updated.album = album }
+        if let releaseID = result.albumReleaseID,
+           let album = result.album,
+           !album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            updated.musicBrainzReleaseID = releaseID
+        }
         if result.applyFilenameMetadata, let albumArtist = result.albumArtist { updated.albumArtist = albumArtist }
         if updated.albumArtist.isEmpty || updated.albumArtist == "Unknown Artist", let albumArtist = result.albumArtist { updated.albumArtist = albumArtist }
         var artworkApplied = false
@@ -302,6 +332,27 @@ import UIKit
         save()
         player?.syncCurrentSong(updated)
         return (updated.title != original.title || updated.artist != original.artist || updated.album != original.album || updated.albumArtist != original.albumArtist, artworkApplied)
+    }
+
+    func resetDownloadedMetadataAndArtwork() async {
+        guard !isScanning, !isFetchingArtwork else { return }
+        await ArtworkCache.shared.reset()
+
+        for index in songs.indices {
+            let existing = songs[index]
+            let url = documentURL(for: existing.fileName)
+            guard fm.fileExists(atPath: url.path) else { continue }
+            guard var local = try? await MetadataService.read(asset: AVURLAsset(url: url), fileName: url.lastPathComponent) else { continue }
+            local.id = existing.id
+            local.fileName = existing.fileName
+            local.importedAt = existing.importedAt
+            local.lastPlayed = existing.lastPlayed
+            local.playCount = existing.playCount
+            local.isFavorite = existing.isFavorite
+            songs[index] = local
+        }
+        save()
+        objectWillChange.send()
     }
 
     func testMusicBrainzConnection() async {
@@ -354,7 +405,11 @@ import UIKit
     var albumGroups: [AlbumGroup] {
         let grouped = Dictionary(grouping: songs) { song in
             let artist = song.albumArtist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? song.displayArtist : song.albumArtist
-            return "\(artistKey(for: artist))\u{1F}\(albumKey(for: song.displayAlbum))"
+            let album = albumKey(for: song.displayAlbum)
+            if let releaseID = song.musicBrainzReleaseID, !releaseID.isEmpty {
+                return "mb:\(releaseID)"
+            }
+            return album == "unknown album" ? album : "\(artistKey(for: artist))\u{1F}\(album)"
         }
         return grouped.map { key, songs in
             let first = songs[0]
@@ -380,24 +435,30 @@ import UIKit
     }
 
     private func artistKey(for value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = cleanedGroupingName(value)
         let display = trimmed.isEmpty ? "Unknown Artist" : trimmed
         return display.precomposedStringWithCanonicalMapping.lowercased(with: .current)
     }
 
     private func albumKey(for value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = cleanedGroupingName(value)
         let display = trimmed.isEmpty ? "Unknown Album" : trimmed
         return display.precomposedStringWithCanonicalMapping.lowercased(with: .current)
     }
 
+    private func cleanedGroupingName(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "'\"_:|–—-•;")))
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+    }
+
     private func displayArtistName(from songs: [Song]) -> String {
-        let value = songs.first?.displayArtist.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let value = cleanedGroupingName(songs.first?.displayArtist ?? "")
         return value.isEmpty ? "Unknown Artist" : value
     }
 
     private func displayAlbumName(from songs: [Song]) -> String {
-        let value = songs.first?.displayAlbum.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let value = cleanedGroupingName(songs.first?.displayAlbum ?? "")
         return value.isEmpty ? "Unknown Album" : value
     }
 
@@ -414,7 +475,14 @@ import UIKit
     func songs(in playlist: Playlist) -> [Song] { playlist.songIDs.compactMap(song) }
 }
 
-private struct PersistedState: Codable { var songs: [Song]; var playlists: [Playlist]; var recentlyPlayed: [UUID]; var currentSongID: UUID?; var savedPosition: Double }
+private struct PersistedState: Codable {
+    var songs: [Song]
+    var playlists: [Playlist]
+    var recentlyPlayed: [UUID]
+    var currentSongID: UUID?
+    var savedPosition: Double
+    var artworkMatchingVersion: Int?
+}
 
 struct MetadataService {
     static func hasEmbeddedArtwork(asset: AVURLAsset) async -> Bool {
@@ -441,9 +509,11 @@ struct MetadataService {
             }?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
 
-        let fallback = filenameCandidates(for: fileName).first ?? FilenameCandidate(artist: "Unknown Artist", title: "Unknown Title")
-        let title = value(.commonIdentifierTitle).isEmpty ? fallback.title : value(.commonIdentifierTitle)
-        let artist = value(.commonIdentifierArtist).isEmpty ? fallback.artist : value(.commonIdentifierArtist)
+        let reliableFallback = reliableFilenameCandidate(for: fileName)
+        let fallbackTitle = reliableFallback?.title ?? cleanedFilename(for: fileName)
+        let fallbackArtist = reliableFallback?.artist ?? "Unknown Artist"
+        let title = value(.commonIdentifierTitle).isEmpty ? fallbackTitle : value(.commonIdentifierTitle)
+        let artist = value(.commonIdentifierArtist).isEmpty ? fallbackArtist : value(.commonIdentifierArtist)
         let album = value(.commonIdentifierAlbumName).isEmpty ? "Unknown Album" : value(.commonIdentifierAlbumName)
         let albumArtist = value(containing: "albumartist").isEmpty ? artist : value(containing: "albumartist")
         let artwork = items.first {
@@ -462,12 +532,31 @@ struct MetadataService {
     }
 
     static func filenameCandidates(for fileName: String) -> [FilenameCandidate] {
+        let name = cleanedFilename(for: fileName)
+        return filenameCandidates(from: name)
+    }
+
+    static func reliableFilenameCandidate(for fileName: String) -> FilenameCandidate? {
+        let candidates = filenameCandidates(for: fileName)
+        guard let first = candidates.first, candidates.count > 1 else { return nil }
+        let firstWordCount = first.artist.split(whereSeparator: { $0 == " " }).count
+        let secondWordCount = first.title.split(whereSeparator: { $0 == " " }).count
+        if first.artist.contains(".") || (firstWordCount == 1 && secondWordCount >= 2) {
+            return first
+        }
+        return nil
+    }
+
+    static func cleanedFilename(for fileName: String) -> String {
         var name = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
         name = name.replacingOccurrences(of: #"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}-"#, with: "", options: .regularExpression)
         name = name.replacingOccurrences(of: #"\[[^\]]*\]|\([^\)]*\)|\{[^\}]*\}"#, with: "", options: .regularExpression)
         name = name.replacingOccurrences(of: #"^\s*\d+\s*[-_.]\s*"#, with: "", options: .regularExpression)
         name = name.replacingOccurrences(of: #"(?i)\b(official\s+lyrics?\s+video|official\s+music\s+video|official\s+visuali[sz]er|official\s+mv|official\s+audio|official\s+video|visuali[sz]er|lyrics?|lyric\s+video|mv|audio|video|hd|4k)\b"#, with: "", options: .regularExpression)
-        name = trimFilenameJunk(name)
+        return trimFilenameJunk(name)
+    }
+
+    private static func filenameCandidates(from name: String) -> [FilenameCandidate] {
 
         let separators = [" - ", " – ", " — ", " | "]
         for separator in separators {
@@ -490,8 +579,8 @@ struct MetadataService {
         result = result.replacingOccurrences(of: #"(?i)\b(official\s+lyrics?\s+video|official\s+music\s+video|official\s+visuali[sz]er|official\s+mv|official\s+audio|official\s+video|visuali[sz]er|lyrics?|lyric\s+video|mv|audio|video|hd|4k)\b"#, with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        result = result.replacingOccurrences(of: #"[|#_•:;]+$"#, with: "", options: .regularExpression)
-        result = result.replacingOccurrences(of: #"^[|#_•:;]+"#, with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"[|#_•:;"'–—_-]+$"#, with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"^[|#_•:;"'–—_-]+"#, with: "", options: .regularExpression)
         return result.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -502,13 +591,19 @@ struct FilenameCandidate: Sendable {
     let title: String
 }
 
+enum ArtworkMatchingConfiguration {
+    static let version = 3
+}
+
 actor ArtworkCache {
     static let shared = ArtworkCache()
     private let directory: URL
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        directory = base.appendingPathComponent("ArtworkCache", isDirectory: true)
+        directory = base
+            .appendingPathComponent("ArtworkCache", isDirectory: true)
+            .appendingPathComponent("v\(ArtworkMatchingConfiguration.version)", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
@@ -520,6 +615,13 @@ actor ArtworkCache {
         let url = directory.appendingPathComponent(key).appendingPathExtension("jpg")
         try? data.write(to: url, options: .atomic)
         print("Artwork cache path:", url.path)
+    }
+
+    func reset() {
+        let base = directory.deletingLastPathComponent()
+        try? FileManager.default.removeItem(at: base)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        print("Artwork cache reset: matching version \(ArtworkMatchingConfiguration.version)")
     }
 
     nonisolated static func resizedArtwork(_ data: Data?, maxDimension: CGFloat = 600) -> Data? {
@@ -665,12 +767,17 @@ actor ArtworkLookupService {
         debugLogs = ["Searching MusicBrainz..."]
         guard song.title != "Unknown Title" else {
             debugLogs.append("No usable title")
-            return ArtworkLookupResult(candidate: nil, album: nil, albumArtist: nil, artwork: nil, applyFilenameMetadata: false, source: .none, logs: debugLogs)
+            return ArtworkLookupResult(candidate: nil, album: nil, albumArtist: nil, albumReleaseID: nil, artwork: nil, applyFilenameMetadata: false, source: .none, logs: debugLogs)
         }
         let lookup = await matchingRelease(for: song)
         let match = lookup.match
         var artwork: Data?
         if let match {
+            debugLogs.append("Song: \(song.title) — \(song.displayArtist)")
+            debugLogs.append("Matched recording: \(match.matchedTitle)")
+            debugLogs.append("Matched artist: \(match.matchedArtist)")
+            debugLogs.append("Match score: \(match.score)")
+            debugLogs.append(match.durationDifference.map { String(format: "Duration difference: %.1fs", $0) } ?? "Duration difference: unavailable")
             for releaseID in match.releaseIDs {
                 guard let url = URL(string: "https://coverartarchive.org/release/\(releaseID)/front-500") else { continue }
                 print("Cover Art Archive URL:", url.absoluteString)
@@ -687,13 +794,20 @@ actor ArtworkLookupService {
                         artwork = ArtworkCache.resizedArtwork(data)
                         print("Artwork decoding:", artwork == nil ? "failed" : "succeeded")
                         debugLogs.append(artwork == nil ? "Image decode failed" : "Artwork decoded")
-                        if artwork != nil { break }
+                        if artwork != nil {
+                            debugLogs.append("Release \(releaseID) artwork accepted: selected recording release")
+                            break
+                        }
+                        debugLogs.append("Release \(releaseID) artwork rejected: image could not be decoded")
+                    } else {
+                        debugLogs.append("Release \(releaseID) artwork rejected: HTTP \(status)")
                     }
                 } catch {
                     print("Artwork lookup failed:", error)
                     debugLogs.append("Cover Art Archive error: \(error.localizedDescription)")
                 }
             }
+            if artwork == nil { debugLogs.append("Artwork rejected: no usable artwork from selected recording releases") }
         }
         if let match {
             debugLogs.append(artwork == nil ? "MusicBrainz match found, artwork missing" : "MusicBrainz artwork found")
@@ -703,17 +817,17 @@ actor ArtworkLookupService {
         }
 
         if artwork == nil && lookup.canUseAppleFallback {
-            if let apple = await AppleArtworkService.shared.lookup(for: song) {
+            if let apple = await AppleArtworkService.shared.lookup(for: song, artistOverride: match?.matchedArtist, titleOverride: match?.matchedTitle) {
                 artwork = apple.artwork
                 debugLogs.append(contentsOf: apple.logs)
-                return ArtworkLookupResult(candidate: match?.candidate, album: match?.album, albumArtist: match?.albumArtist, artwork: artwork, applyFilenameMetadata: match?.applyFilenameMetadata ?? false, source: .apple, logs: debugLogs)
+                return ArtworkLookupResult(candidate: match?.candidate, album: match?.album, albumArtist: match?.albumArtist, albumReleaseID: match?.releaseIDs.first, artwork: artwork, applyFilenameMetadata: match?.applyFilenameMetadata ?? false, source: .apple, logs: debugLogs)
             }
             debugLogs.append("Apple fallback found no confident artwork")
         } else if artwork == nil {
             debugLogs.append("Apple fallback skipped because MusicBrainz was temporarily unavailable")
         }
 
-        return ArtworkLookupResult(candidate: match?.candidate, album: match?.album, albumArtist: match?.albumArtist, artwork: artwork, applyFilenameMetadata: match?.applyFilenameMetadata ?? false, source: artwork == nil ? .none : .musicBrainz, logs: debugLogs)
+        return ArtworkLookupResult(candidate: match?.candidate, album: match?.album, albumArtist: match?.albumArtist, albumReleaseID: match?.releaseIDs.first, artwork: artwork, applyFilenameMetadata: match?.applyFilenameMetadata ?? false, source: artwork == nil ? .none : .musicBrainz, logs: debugLogs)
     }
 
     func testConnection() async -> [String] {
@@ -834,19 +948,28 @@ actor ArtworkLookupService {
                 let resultTitle = normalized(recording.title ?? "")
                 let resultArtist = normalized(recording.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: " ") ?? "")
                 let titleSimilarity = similarity(resultTitle, title)
-                let artistSimilarity = normalizedArtist == "unknownartist" ? 1 : similarity(resultArtist, normalizedArtist)
-                guard (recording.score ?? 0) >= 90, titleSimilarity >= 0.8, artistSimilarity >= 0.8,
+                let artistIsUnknown = normalizedArtist == "unknownartist" || normalizedArtist.isEmpty
+                let artistSimilarity = artistIsUnknown ? 0 : similarity(resultArtist, normalizedArtist)
+                let durationDifference = recording.length.flatMap { length in
+                    duration > 0 ? abs(Double(length) / 1000 - duration) : nil
+                }
+                let durationMatches = durationDifference.map { $0 <= 8 } ?? true
+                let artistMatches = artistIsUnknown ? !resultArtist.isEmpty : artistSimilarity >= 0.85
+                guard (recording.score ?? 0) >= 90, titleSimilarity >= 0.90, artistMatches, durationMatches,
                       let release = recording.releases?.first else { return nil }
                 var confidence = Double(recording.score ?? 0) + titleSimilarity * 20 + artistSimilarity * 20
-                if let length = recording.length, duration > 0 {
-                    let difference = abs(Double(length) / 1000 - duration)
-                    if difference <= 5 { confidence += 10 }
-                    if difference > 30 { confidence -= 10 }
+                if let difference = durationDifference {
+                    if difference <= 8 { confidence += 10 }
                 }
                 let releaseIDs = recording.releases?.compactMap(\.id) ?? []
                 print("MusicBrainz candidate:", candidate.artist, "/", candidate.title, "score:", recording.score ?? 0, "recording:", recording.title ?? "", "release IDs:", releaseIDs)
                 let albumArtist = release.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: " ")
-                return MusicBrainzMatch(candidate: candidate, releaseIDs: releaseIDs, score: recording.score ?? 0, confidence: confidence, album: release.title, albumArtist: albumArtist)
+                let matchedArtist = recording.artistCredit?.compactMap { $0.name ?? $0.artist?.name }.joined(separator: ", ") ?? candidate.artist
+                let matchedTitle = recording.title ?? candidate.title
+                let matchedCandidate = FilenameCandidate(artist: matchedArtist, title: matchedTitle)
+                debugLogs.append(String(format: "Accepted candidate: title %.2f, artist %.2f", titleSimilarity, artistSimilarity))
+                debugLogs.append(durationDifference.map { String(format: "Duration difference: %.1fs", $0) } ?? "Duration difference: unavailable")
+                return MusicBrainzMatch(candidate: matchedCandidate, releaseIDs: releaseIDs, score: recording.score ?? 0, confidence: confidence, album: release.title, albumArtist: albumArtist, matchedTitle: matchedTitle, matchedArtist: matchedArtist, durationDifference: durationDifference)
             }
         return MusicBrainzSearchResult(
             match: matches.max(by: { $0.confidence < $1.confidence }),
@@ -871,6 +994,7 @@ struct ArtworkLookupResult {
     let candidate: FilenameCandidate?
     let album: String?
     let albumArtist: String?
+    let albumReleaseID: String?
     let artwork: Data?
     let applyFilenameMetadata: Bool
     let source: ArtworkSource
@@ -897,9 +1021,15 @@ actor AppleArtworkService {
     static let shared = AppleArtworkService()
     private var lastRequest = Date.distantPast
 
-    func lookup(for song: Song) async -> AppleArtworkResult? {
-        let artist = song.artist == "Unknown Artist" ? "" : song.artist
-        let query = [artist, song.title].filter { !$0.isEmpty }.joined(separator: " ")
+    func lookup(for song: Song, artistOverride: String? = nil, titleOverride: String? = nil) async -> AppleArtworkResult? {
+        let artist = artistOverride ?? (song.artist == "Unknown Artist" ? "" : song.artist)
+        let title = titleOverride ?? song.title
+        guard !artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              artist.caseInsensitiveCompare("Unknown Artist") != .orderedSame else {
+            print("Apple artwork rejected: artist is unknown")
+            return nil
+        }
+        let query = [artist, title].filter { !$0.isEmpty }.joined(separator: " ")
         guard !query.isEmpty else { return nil }
 
         var components = URLComponents(string: "https://itunes.apple.com/search")
@@ -936,23 +1066,19 @@ actor AppleArtworkService {
         }
         logs.append("Apple results: \(decoded.results.count)")
 
-        let expectedTitle = normalized(song.title)
+        let expectedTitle = normalized(title)
         let expectedArtist = normalized(artist)
-        let candidates = decoded.results.compactMap { result -> (AppleTrack, Double)? in
+        let candidates = decoded.results.compactMap { result -> (AppleTrack, Double, Double, Double, Double?)? in
             guard let resultTitle = result.trackName, let resultArtist = result.artistName else { return nil }
             let titleScore = similarity(normalized(resultTitle), expectedTitle)
-            let artistScore = expectedArtist.isEmpty ? 1 : similarity(normalized(resultArtist), expectedArtist)
-            let durationScore: Double
-            if song.duration > 0, let milliseconds = result.trackTimeMillis {
-                let difference = abs(Double(milliseconds) / 1000 - song.duration)
-                durationScore = difference <= 5 ? 1 : max(0, 1 - difference / 60)
-            } else {
-                durationScore = 0.5
-            }
+            let artistScore = similarity(normalized(resultArtist), expectedArtist)
+            let durationDifference = song.duration > 0 ? result.trackTimeMillis.map { abs(Double($0) / 1000 - song.duration) } : nil
+            guard titleScore >= 0.90, artistScore >= 0.85, durationDifference.map({ $0 <= 8 }) ?? true else { return nil }
+            let durationScore = durationDifference.map { max(0, 1 - $0 / 8) } ?? 0.5
             let confidence = titleScore * 0.55 + artistScore * 0.35 + durationScore * 0.10
-            return (result, confidence)
+            return (result, confidence, titleScore, artistScore, durationDifference)
         }
-        guard let best = candidates.max(by: { $0.1 < $1.1 }), best.1 >= 0.78 else {
+        guard let best = candidates.max(by: { $0.1 < $1.1 }), best.1 >= 0.85 else {
             logs.append("Apple result rejected: no confident match")
             print(logs.joined(separator: "\n"))
             return nil
@@ -963,6 +1089,8 @@ actor AppleArtworkService {
         let selectedArtist = selected.artistName ?? ""
         logs.append("Apple selected: \(selectedTitle) — \(selectedArtist)")
         logs.append(String(format: "Apple confidence: %.0f%%", best.1 * 100))
+        logs.append(String(format: "Apple title similarity: %.2f, artist similarity: %.2f", best.2, best.3))
+        logs.append(best.4.map { String(format: "Apple duration difference: %.1fs", $0) } ?? "Apple duration difference: unavailable")
         guard let artworkURL = selected.artworkURL else {
             logs.append("Apple selected result has no artwork URL")
             print(logs.joined(separator: "\n"))
@@ -1027,6 +1155,9 @@ private struct MusicBrainzMatch {
     let confidence: Double
     let album: String?
     let albumArtist: String?
+    let matchedTitle: String
+    let matchedArtist: String
+    let durationDifference: Double?
     var applyFilenameMetadata = false
 }
 

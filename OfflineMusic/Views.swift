@@ -455,6 +455,7 @@ struct SettingsView: View {
     @EnvironmentObject private var store: MusicStore
     @EnvironmentObject private var player: AudioPlayerService
     private let playbackSpeeds: [Float] = [0.75, 1.0, 1.25, 1.5, 2.0]
+    @State private var showingResetConfirmation = false
 
     var body: some View {
         NavigationStack {
@@ -516,7 +517,10 @@ struct SettingsView: View {
                             .foregroundStyle(Color.muted)
                     }
 
-                    Button("Clear artwork cache") {}
+                    Button("Reset Downloaded Metadata & Artwork") {
+                        showingResetConfirmation = true
+                    }
+                    .disabled(store.isScanning || store.isFetchingArtwork)
                     Text("\(store.songs.count) songs • \(store.songs.reduce(0) { $0 + Int($1.duration) / 60 }) minutes")
                         .foregroundStyle(Color.muted)
                 }
@@ -529,6 +533,14 @@ struct SettingsView: View {
             .scrollContentBackground(.hidden)
             .background(store.oledTheme ? Color.black : Color.ink)
             .navigationTitle("Settings")
+            .alert("Reset downloaded metadata and artwork?", isPresented: $showingResetConfirmation) {
+                Button("Reset", role: .destructive) {
+                    Task { await store.resetDownloadedMetadataAndArtwork() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Embedded tags, audio files, playlists, favorites, history, and song IDs will be preserved.")
+            }
         }
     }
 

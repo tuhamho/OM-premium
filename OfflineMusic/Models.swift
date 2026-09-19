@@ -7,6 +7,7 @@ struct Song: Identifiable, Codable, Hashable {
     var artist: String
     var album: String
     var albumArtist: String = ""
+    var musicBrainzReleaseID: String?
     var genre: String = ""
     var year: Int?
     var duration: Double = 0
@@ -16,6 +17,66 @@ struct Song: Identifiable, Codable, Hashable {
     var lastPlayed: Date?
     var playCount: Int = 0
     var isFavorite: Bool = false
+
+    init(id: UUID = UUID(), title: String, artist: String, album: String, albumArtist: String = "", musicBrainzReleaseID: String? = nil, genre: String = "", year: Int? = nil, duration: Double = 0, fileName: String, artworkData: Data? = nil, importedAt: Date = .now, lastPlayed: Date? = nil, playCount: Int = 0, isFavorite: Bool = false) {
+        self.id = id
+        self.title = title
+        self.artist = artist
+        self.album = album
+        self.albumArtist = albumArtist
+        self.musicBrainzReleaseID = musicBrainzReleaseID
+        self.genre = genre
+        self.year = year
+        self.duration = duration
+        self.fileName = fileName
+        self.artworkData = artworkData
+        self.importedAt = importedAt
+        self.lastPlayed = lastPlayed
+        self.playCount = playCount
+        self.isFavorite = isFavorite
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, artist, album, albumArtist, musicBrainzReleaseID, genre, year, duration, fileName, artworkData, importedAt, lastPlayed, playCount, isFavorite
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? "Unknown Title"
+        artist = try container.decodeIfPresent(String.self, forKey: .artist) ?? "Unknown Artist"
+        album = try container.decodeIfPresent(String.self, forKey: .album) ?? "Unknown Album"
+        albumArtist = try container.decodeIfPresent(String.self, forKey: .albumArtist) ?? ""
+        musicBrainzReleaseID = try container.decodeIfPresent(String.self, forKey: .musicBrainzReleaseID)
+        genre = try container.decodeIfPresent(String.self, forKey: .genre) ?? ""
+        year = try container.decodeIfPresent(Int.self, forKey: .year)
+        duration = try container.decodeIfPresent(Double.self, forKey: .duration) ?? 0
+        fileName = try container.decodeIfPresent(String.self, forKey: .fileName) ?? ""
+        artworkData = try container.decodeIfPresent(Data.self, forKey: .artworkData)
+        importedAt = try container.decodeIfPresent(Date.self, forKey: .importedAt) ?? .now
+        lastPlayed = try container.decodeIfPresent(Date.self, forKey: .lastPlayed)
+        playCount = try container.decodeIfPresent(Int.self, forKey: .playCount) ?? 0
+        isFavorite = try container.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(artist, forKey: .artist)
+        try container.encode(album, forKey: .album)
+        try container.encode(albumArtist, forKey: .albumArtist)
+        try container.encodeIfPresent(musicBrainzReleaseID, forKey: .musicBrainzReleaseID)
+        try container.encode(genre, forKey: .genre)
+        try container.encodeIfPresent(year, forKey: .year)
+        try container.encode(duration, forKey: .duration)
+        try container.encode(fileName, forKey: .fileName)
+        try container.encodeIfPresent(artworkData, forKey: .artworkData)
+        try container.encode(importedAt, forKey: .importedAt)
+        try container.encodeIfPresent(lastPlayed, forKey: .lastPlayed)
+        try container.encode(playCount, forKey: .playCount)
+        try container.encode(isFavorite, forKey: .isFavorite)
+    }
 
     var displayArtist: String { artist.isEmpty ? "Unknown Artist" : artist }
     var displayAlbum: String { album.isEmpty ? "Unknown Album" : album }
