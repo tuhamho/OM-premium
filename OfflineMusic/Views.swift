@@ -2,6 +2,29 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
 
+private enum SpotufyUI {
+    static let smallRadius: CGFloat = 10
+    static let mediumRadius: CGFloat = 16
+    static let largeRadius: CGFloat = 24
+    static let spacingS: CGFloat = 8
+    static let spacingM: CGFloat = 14
+    static let spacingL: CGFloat = 22
+    static let homeArtwork: CGFloat = 148
+    static let rowArtwork: CGFloat = 54
+}
+
+private struct SpotufyPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .animation(.spring(response: 0.2, dampingFraction: 0.82), value: configuration.isPressed)
+    }
+}
+
+private extension View {
+    func spotufyPressStyle() -> some View { buttonStyle(SpotufyPressStyle()) }
+}
+
 struct RootView: View {
     @EnvironmentObject private var store: MusicStore
     @State private var tab = 0
@@ -21,7 +44,7 @@ struct RootView: View {
             .safeAreaPadding(.bottom, store.currentSongID == nil ? 62 : 126)
             RootPlayerBar(tab: $tab) { showNowPlaying = true }
         }
-        .background(Color.ink.ignoresSafeArea())
+        .background((store.oledTheme ? Color.black : (store.theme == .light ? Color(.systemGroupedBackground) : Color.ink)).ignoresSafeArea())
         .sheet(isPresented: $showNowPlaying) { NowPlayingView() }
         .sheet(isPresented: $store.showDebugPanel) { DebugStatusView() }
         .onAppear {
@@ -35,6 +58,7 @@ struct RootView: View {
 }
 
 private struct RootPlayerBar: View {
+    @EnvironmentObject private var store: MusicStore
     @EnvironmentObject private var player: AudioPlayerService
     @Binding var tab: Int
     let openNowPlaying: () -> Void
@@ -51,7 +75,7 @@ private struct RootPlayerBar: View {
                 tabButton("gearshape.fill", "Settings", 3)
             }
             .padding(.top, 10).padding(.bottom, 8)
-            .background(.ultraThinMaterial)
+            .background(.thinMaterial)
         }
     }
 
@@ -68,10 +92,11 @@ private struct RootPlayerBar: View {
                 Image(systemName: icon).font(.system(size: 19, weight: .semibold))
                 Text(text).font(.caption2)
             }
-            .foregroundStyle(tab == value ? Color.lime : .white.opacity(0.55))
+            .foregroundStyle(tab == value ? store.accentChoice.color : .secondary)
             .frame(maxWidth: .infinity)
         }
         .accessibilityLabel(text)
+        .spotufyPressStyle()
     }
 }
 
@@ -86,11 +111,16 @@ struct HomeView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 28) {
-                    Text(greeting)
-                        .font(.largeTitle.bold())
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.top, 12)
+                LazyVStack(alignment: .leading, spacing: 28) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Spotúfy")
+                            .font(.title3.weight(.bold))
+                            .foregroundStyle(store.accentChoice.color)
+                        Text(greeting)
+                            .font(.largeTitle.bold())
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 12)
                     if store.songs.isEmpty {
                         EmptyState(title: "Your music, your way", message: "Import local audio files to start building your library.", icon: "waveform")
                     } else {
@@ -102,7 +132,7 @@ struct HomeView: View {
                 }
                 .padding(.horizontal, 20)
             }
-            .background(Color.ink)
+            .background(Color(.systemBackground))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Image(systemName: "bell").foregroundStyle(.white)
@@ -121,8 +151,8 @@ struct HomeView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text(title).font(.title3.bold())
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 14) {
-                                ForEach(songs) { song in
+                    LazyHStack(spacing: SpotufyUI.spacingM) {
+                                ForEach(songs, id: \.id) { song in
                                     SongCard(song: song) {
                                         let started = DispatchTime.now().uptimeNanoseconds
                                         store.play(song, from: songs)
@@ -261,7 +291,7 @@ struct LibraryView: View {
                 .scrollContentBackground(.hidden)
                 .scrollDismissesKeyboard(.interactively)
             }
-            .background(Color.ink)
+            .background(Color(.systemBackground))
             .navigationTitle("Your Library")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -306,10 +336,7 @@ struct PlaylistsView: View {
                             PlaylistDetail(playlist: playlist)
                         } label: {
                             HStack {
-                                RoundedRectangle(cornerRadius: 10)
-                                    .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
-                                    .frame(width: 58, height: 58)
-                                    .overlay { Image(systemName: "music.note").font(.title2) }
+                                ArtworkView(song: store.songs(in: playlist).first, size: 58)
                                 VStack(alignment: .leading) {
                                     Text(playlist.name).font(.headline)
                                     Text("\(playlist.songIDs.count) songs")
@@ -317,7 +344,9 @@ struct PlaylistsView: View {
                                         .font(.subheadline)
                                 }
                             }
+                            .padding(.vertical, 6)
                         }
+                        .listRowBackground(Color.clear)
                     }
                     .onDelete { offsets in
                         store.playlists.remove(atOffsets: offsets)
@@ -332,7 +361,7 @@ struct PlaylistsView: View {
             }
             .listStyle(.insetGrouped)
             .scrollContentBackground(.hidden)
-            .background(Color.ink)
+            .background(Color(.systemBackground))
             .navigationTitle("Playlists")
             .alert("New Playlist", isPresented: $showingAdd) {
                 TextField("Name", text: $name)
@@ -426,13 +455,13 @@ struct ArtistDetailView: View {
                     .buttonStyle(.bordered)
                 }
 
-                ForEach(songs) { song in
+                ForEach(songs, id: \.id) { song in
                     SongRow(song: song) { player.play(song, from: songs) }
                 }
             }
             .padding(20)
         }
-        .background(Color.ink)
+        .background(Color(.systemBackground))
         .navigationTitle(artist)
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -452,13 +481,31 @@ struct AlbumDetailView: View {
                         Text(group.artist).foregroundStyle(Color.muted)
                     }
                 }
-                ForEach(group.songs) { song in
+                HStack {
+                    Button {
+                        if let first = group.songs.first { player.play(first, from: group.songs) }
+                    } label: {
+                        Label("Play", systemImage: "play.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button {
+                        let shuffled = group.songs.shuffled()
+                        if let first = shuffled.first {
+                            player.shuffle = true
+                            player.play(first, from: shuffled)
+                        }
+                    } label: {
+                        Label("Shuffle", systemImage: "shuffle").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                ForEach(group.songs, id: \.id) { song in
                     SongRow(song: song) { player.play(song, from: group.songs) }
                 }
             }
             .padding(20)
         }
-        .background(Color.ink)
+        .background(Color(.systemBackground))
         .navigationTitle(group.name)
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -497,13 +544,13 @@ struct PlaylistDetail: View {
                     }
                     .buttonStyle(.bordered)
                 }
-                ForEach(songs) { song in
+                ForEach(songs, id: \.id) { song in
                     SongRow(song: song) { player.play(song, from: songs) }
                 }
             }
             .padding(20)
         }
-        .background(Color.ink)
+        .background(Color(.systemBackground))
         .navigationTitle(playlist.name)
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -529,6 +576,32 @@ struct SettingsView: View {
                     }
                 }
                 Section("Appearance") {
+                    Picker("Theme", selection: Binding(
+                        get: { store.theme },
+                        set: {
+                            store.theme = $0
+                            store.oledTheme = $0 == .dark
+                            store.save()
+                        }
+                    )) {
+                        ForEach(AppTheme.allCases) { theme in
+                            Text(theme.rawValue).tag(theme)
+                        }
+                    }
+                    Picker("Accent Color", selection: Binding(
+                        get: { store.accentChoice },
+                        set: {
+                            store.accentChoice = $0
+                            store.accent = $0.color
+                            store.save()
+                        }
+                    )) {
+                        ForEach(AccentColorChoice.allCases) { choice in
+                            Label(choice.rawValue, systemImage: "circle.fill")
+                                .foregroundStyle(choice.color)
+                                .tag(choice)
+                        }
+                    }
                     Toggle("Pure black OLED theme", isOn: $store.oledTheme)
                 }
                 Section("Library") {
@@ -617,7 +690,10 @@ struct SettingsView: View {
                 }
             }
             .scrollContentBackground(.hidden)
-            .background(store.oledTheme ? Color.black : Color.ink)
+            .background(store.oledTheme ? Color.black : (store.theme == .light ? Color(.systemGroupedBackground) : Color.ink))
+            .tint(store.accentChoice.color)
+            .onChange(of: store.oledTheme) { _, _ in store.save() }
+            .onChange(of: store.resumeSession) { _, _ in store.save() }
             .navigationTitle("Settings")
             .alert("Reset downloaded metadata and artwork?", isPresented: $showingResetConfirmation) {
                 Button("Reset", role: .destructive) {
@@ -686,7 +762,10 @@ struct NowPlayingView: View {
             VStack(spacing: 24) {
                 ArtworkView(song: player.currentSong, size: 330).shadow(color: .black.opacity(0.4), radius: 20)
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(player.currentSong?.title ?? "Nothing playing").font(.title.bold())
+                    Text(player.currentSong?.title ?? "Nothing playing")
+                        .font(.title.bold())
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
                     Text(player.currentSong?.displayArtist ?? "").foregroundStyle(Color.muted)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -696,7 +775,7 @@ struct NowPlayingView: View {
                 }
                 .font(.caption).foregroundStyle(Color.muted)
                 HStack {
-                    Button { player.shuffle.toggle() } label: { Image(systemName: "shuffle").font(.title3) }.foregroundStyle(player.shuffle ? Color.lime : .white)
+                    Button { player.shuffle.toggle() } label: { Image(systemName: "shuffle").font(.title3) }.foregroundStyle(player.shuffle ? store.accentChoice.color : .secondary)
                     Spacer()
                     Button { player.previous() } label: { Image(systemName: "backward.fill").font(.title2) }
                     Spacer()
@@ -709,7 +788,7 @@ struct NowPlayingView: View {
                         let index = modes.firstIndex(of: player.repeatMode) ?? 0
                         player.repeatMode = modes[(index + 1) % modes.count]
                     } label: { Image(systemName: "repeat").font(.title3) }
-                        .foregroundStyle(player.repeatMode == .off ? .white : Color.lime)
+                        .foregroundStyle(player.repeatMode == .off ? .secondary : store.accentChoice.color)
                 }
                 .padding(.horizontal, 8)
                 HStack {
@@ -719,7 +798,16 @@ struct NowPlayingView: View {
                 }
                 Spacer()
             }
-            .padding(24).background(Color.ink)
+            .padding(24)
+            .background {
+                if store.oledTheme {
+                    Color.black
+                } else if store.theme == .light {
+                    Color(.systemBackground)
+                } else {
+                    LinearGradient(colors: [Color.ink, Color.black], startPoint: .top, endPoint: .bottom)
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button { dismiss() } label: { Image(systemName: "chevron.down") } }
                 ToolbarItem(placement: .principal) { Text("NOW PLAYING").font(.caption.bold()).tracking(2) }
@@ -1078,19 +1166,27 @@ struct MiniPlayer: View {
 
     var body: some View {
         Button(action: open) {
-            HStack(spacing: 12) {
-                ArtworkView(song: song, size: 44)
-                VStack(alignment: .leading) {
-                    Text(song.title).font(.subheadline.weight(.semibold)).lineLimit(1)
-                    Text(song.displayArtist).font(.caption).foregroundStyle(Color.muted).lineLimit(1)
+            VStack(spacing: 8) {
+                HStack(spacing: 12) {
+                    ArtworkView(song: song, size: 44)
+                    VStack(alignment: .leading) {
+                        Text(song.title).font(.subheadline.weight(.semibold)).lineLimit(1)
+                        Text(song.displayArtist).font(.caption).foregroundStyle(Color.muted).lineLimit(1)
+                    }
+                    Spacer()
+                    Button { player.toggle() } label: { Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").font(.title3) }.buttonStyle(.plain)
+                    Button { player.next() } label: { Image(systemName: "forward.fill") }.buttonStyle(.plain)
                 }
-                Spacer()
-                Button { player.toggle() } label: { Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").font(.title3) }.buttonStyle(.plain)
-                Button { player.next() } label: { Image(systemName: "forward.fill") }.buttonStyle(.plain)
+                ProgressView(value: player.currentSong?.duration == nil ? 0 : player.elapsed, total: max(player.currentSong?.duration ?? 1, 1))
+                    .tint(.primary)
+                    .scaleEffect(y: 0.35)
             }
-            .padding(10).background(Color.cardLight)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(.thinMaterial)
         }
         .buttonStyle(.plain)
+        .spotufyPressStyle()
     }
 }
 
@@ -1101,14 +1197,15 @@ struct SongCard: View {
     var body: some View {
         Button(action: play) {
             VStack(alignment: .leading, spacing: 8) {
-                ArtworkView(song: song, size: 142)
+                ArtworkView(song: song, size: SpotufyUI.homeArtwork)
                 Text(song.title).font(.subheadline.weight(.semibold)).lineLimit(1)
                 Text(song.displayArtist).font(.caption).foregroundStyle(Color.muted).lineLimit(1)
             }
-            .frame(width: 142, alignment: .leading)
+            .frame(width: SpotufyUI.homeArtwork, alignment: .leading)
         }
         .buttonStyle(.plain)
         .songActions(for: song, play: play)
+        .spotufyPressStyle()
     }
 }
 
@@ -1119,9 +1216,9 @@ struct SongRow: View {
     var body: some View {
         Button(action: play) {
             HStack(spacing: 12) {
-                ArtworkView(song: song, size: 52)
+                ArtworkView(song: song, size: SpotufyUI.rowArtwork)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(song.title).foregroundStyle(.white).lineLimit(1)
+                    Text(song.title).foregroundStyle(.primary).lineLimit(1)
                     Text("\(song.displayArtist) • \(song.displayAlbum)").font(.caption).foregroundStyle(Color.muted).lineLimit(1)
                 }
                 Spacer()
@@ -1131,6 +1228,7 @@ struct SongRow: View {
         .listRowBackground(Color.clear)
         .buttonStyle(.plain)
         .songActions(for: song, play: play)
+        .spotufyPressStyle()
     }
 }
 
@@ -1300,6 +1398,16 @@ private final class ArtworkImageCache {
     static let shared = ArtworkImageCache()
     private let cache = NSCache<NSString, UIImage>()
 
+    private init() {
+        cache.countLimit = 256
+        cache.totalCostLimit = 80 * 1024 * 1024
+    }
+
+    static func key(for song: Song?) -> String {
+        guard let song else { return "none" }
+        return "\(song.id.uuidString)-\(song.artworkData?.count ?? 0)"
+    }
+
     func image(for key: String) -> UIImage? {
         cache.object(forKey: key as NSString)
     }
@@ -1313,10 +1421,14 @@ struct ArtworkView: View {
     let song: Song?
     let size: CGFloat
     @State private var decodedImage: UIImage?
+    @State private var loadedArtworkKey: String?
 
     var body: some View {
+        let key = artworkKey
+        let stateImage = loadedArtworkKey == key ? decodedImage : nil
+        let image = stateImage ?? ArtworkImageCache.shared.image(for: key)
         Group {
-            if let image = decodedImage {
+            if let image {
                 Image(uiImage: image).resizable().scaledToFill()
             } else {
                 LinearGradient(colors: placeholderColors, startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -1326,23 +1438,26 @@ struct ArtworkView: View {
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: size > 100 ? 16 : 8))
         .task(id: artworkKey) {
-            decodedImage = nil
-            guard let data = song?.artworkData else { return }
             let key = artworkKey
             if let cached = ArtworkImageCache.shared.image(for: key) {
                 decodedImage = cached
+                loadedArtworkKey = key
                 return
             }
+            if loadedArtworkKey != key {
+                decodedImage = nil
+            }
+            guard let data = song?.artworkData else { return }
             await Task.yield()
             guard !Task.isCancelled, let image = UIImage(data: data) else { return }
             ArtworkImageCache.shared.insert(image, for: key)
             decodedImage = image
+            loadedArtworkKey = key
         }
     }
 
     private var artworkKey: String {
-        guard let song else { return "none" }
-        return "\(song.id.uuidString)-\(song.artworkData?.count ?? 0)"
+        ArtworkImageCache.key(for: song)
     }
 
     private var placeholderColors: [Color] {

@@ -280,6 +280,41 @@ struct AlbumGroup: Identifiable {
 }
 
 enum RepeatMode: String, Codable, CaseIterable { case off, all, one }
+enum AppTheme: String, Codable, CaseIterable, Identifiable {
+    case system = "System"
+    case dark = "Dark"
+    case light = "Light"
+    var id: String { rawValue }
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: return nil
+        case .dark: return .dark
+        case .light: return .light
+        }
+    }
+}
+
+enum AccentColorChoice: String, Codable, CaseIterable, Identifiable {
+    case green = "Green"
+    case blue = "Blue"
+    case purple = "Purple"
+    case pink = "Pink"
+    case orange = "Orange"
+    case red = "Red"
+    var id: String { rawValue }
+
+    var color: Color {
+        switch self {
+        case .green: return .lime
+        case .blue: return .blue
+        case .purple: return .purple
+        case .pink: return .pink
+        case .orange: return .orange
+        case .red: return .red
+        }
+    }
+}
+
 enum LibraryFilter: String, CaseIterable { case songs = "Songs", albums = "Albums", artists = "Artists", playlists = "Playlists", favorites = "Favorites" }
 enum SortMode: String, CaseIterable { case recentlyAdded = "Recently Added", title = "Title", artist = "Artist", album = "Album", mostPlayed = "Most Played", duration = "Duration" }
 

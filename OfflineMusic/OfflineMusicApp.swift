@@ -14,7 +14,8 @@ struct OfflineMusicApp: App {
             RootView()
                 .environmentObject(store)
                 .environmentObject(player)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(store.theme.colorScheme)
+                .tint(store.accentChoice.color)
                 .task {
                     await store.load()
                     player.configure(with: store)

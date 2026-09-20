@@ -17,6 +17,8 @@ enum PerformanceDiagnostics {
     @Published var resumeSession = true
     @Published var oledTheme = false
     @Published var accent = Color.lime
+    @Published var theme: AppTheme = .system
+    @Published var accentChoice: AccentColorChoice = .green
     @Published var isScanning = false
     @Published var scanProgress = 0
     @Published var scanTotal = 0
@@ -104,6 +106,10 @@ enum PerformanceDiagnostics {
         guard let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
         let decodeDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead
         songs = state.songs; playlists = state.playlists; recentlyPlayed = state.recentlyPlayed; currentSongID = state.currentSongID; savedPosition = state.savedPosition
+        theme = AppTheme(rawValue: state.theme ?? "") ?? .system
+        accentChoice = AccentColorChoice(rawValue: state.accentChoice ?? "") ?? .green
+        accent = accentChoice.color
+        oledTheme = state.oledTheme ?? (theme == .dark)
         invalidateHomeCache()
         let publishDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead - decodeDuration
         print(String(format: "STARTUP PERF persisted load: %.1fms, decode: %.1fms, publish songs: %.1fms, songs: %d", persistedRead, decodeDuration, publishDuration, songs.count))
@@ -137,7 +143,7 @@ enum PerformanceDiagnostics {
 
     func save() {
         let startedAt = DispatchTime.now().uptimeNanoseconds
-        let state = PersistedState(songs: songs, playlists: playlists, recentlyPlayed: recentlyPlayed, currentSongID: currentSongID, savedPosition: savedPosition, artworkMatchingVersion: ArtworkMatchingConfiguration.version)
+        let state = PersistedState(songs: songs, playlists: playlists, recentlyPlayed: recentlyPlayed, currentSongID: currentSongID, savedPosition: savedPosition, artworkMatchingVersion: ArtworkMatchingConfiguration.version, theme: theme.rawValue, accentChoice: accentChoice.rawValue, oledTheme: oledTheme)
         if let data = try? JSONEncoder().encode(state) { try? data.write(to: stateURL, options: .atomic) }
         let duration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
         if duration > 30 { print(String(format: "PERF save library JSON: %.1fms", duration)) }
@@ -164,7 +170,9 @@ enum PerformanceDiagnostics {
         guard homeCacheRevision != libraryRevision else { return }
         cachedHomeRecentlyPlayed = recentlyPlayed.compactMap(song)
         cachedHomeRecentlyAdded = Array(songs.sorted { $0.importedAt > $1.importedAt }.prefix(10))
-        cachedHomeAlbums = Dictionary(grouping: songs, by: { $0.displayAlbum }).compactMap { $0.value.first }
+        cachedHomeAlbums = Dictionary(grouping: songs, by: { $0.displayAlbum })
+            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+            .compactMap { $0.value.first }
         cachedHomeFavorites = songs.filter(\.isFavorite)
         homeCacheRevision = libraryRevision
     }
@@ -1257,6 +1265,9 @@ private struct PersistedState: Codable {
     var currentSongID: UUID?
     var savedPosition: Double
     var artworkMatchingVersion: Int?
+    var theme: String?
+    var accentChoice: String?
+    var oledTheme: Bool?
 }
 
 struct MetadataService {
