@@ -88,6 +88,14 @@ enum PerformanceDiagnostics {
         return audioDirectory.appendingPathComponent(fileName)
     }
 
+    func localURL(for song: Song) -> URL {
+        if let relativePath = song.fileFingerprint?.relativePath {
+            let url = documentsDirectory.appendingPathComponent(relativePath)
+            if fm.fileExists(atPath: url.path) { return url }
+        }
+        return documentURL(for: song.fileName)
+    }
+
     private func relativeDocumentPath(for url: URL) -> String {
         let prefix = documentsDirectory.path.hasSuffix("/") ? documentsDirectory.path : documentsDirectory.path + "/"
         return url.path.hasPrefix(prefix) ? String(url.path.dropFirst(prefix.count)) : url.lastPathComponent
@@ -2050,14 +2058,16 @@ private struct MusicBrainzRelease: Decodable {
         if store.resumeSession, let restored = store.song(store.currentSongID) {
             currentSong = restored
             duration = restored.duration
-            elapsed = store.savedPosition
+            elapsed = clampedPosition(store.savedPosition, for: restored)
             playbackContextIDs = store.songs.map(\.id)
             randomPlayedIDs = [restored.id]
             playbackHistory = [restored.id]
             historyIndex = 0
             queue = store.songs
         }
-        configureAudioSession(); configureRemoteCommands()
+        isPlaying = false
+        player = nil
+        configureAudioSession(); configureRemoteCommands(); updateNowPlaying()
     }
     func syncCurrentSong(_ song: Song) {
         guard currentSong?.id == song.id else { return }
@@ -2066,10 +2076,48 @@ private struct MusicBrainzRelease: Decodable {
     }
     private func configureAudioSession() { try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: []); try? AVAudioSession.sharedInstance().setActive(true) }
 
+    private var hasLoadedCurrentSong: Bool {
+        player?.currentItem != nil && currentSong != nil
+    }
+
+    private func clampedPosition(_ position: Double, for song: Song) -> Double {
+        let safePosition = max(0, position.isFinite ? position : 0)
+        guard song.duration > 0 else { return 0 }
+        return min(safePosition, max(0, song.duration - 0.25))
+    }
+
+    private func handleMissingFile(for song: Song) {
+        if currentSong?.id == song.id || store?.currentSongID == song.id {
+            if let timeObserver {
+                player?.removeTimeObserver(timeObserver)
+                self.timeObserver = nil
+            }
+            if let endObserver {
+                NotificationCenter.default.removeObserver(endObserver)
+                self.endObserver = nil
+            }
+            currentSong = nil
+            player = nil
+            isPlaying = false
+            elapsed = 0
+            duration = 0
+            store?.currentSongID = nil
+            store?.savedPosition = 0
+            store?.scheduleSave()
+            updateNowPlaying()
+        }
+        print("Playback file not found: \(song.fileName)")
+    }
+
     func play(_ song: Song, from list: [Song]? = nil) {
         let tapStartedAt = DispatchTime.now().uptimeNanoseconds
         if currentSong?.id == song.id, list == nil {
-            if !isPlaying { player?.play(); isPlaying = true }
+            if isPlaying {
+                let duration = Double(DispatchTime.now().uptimeNanoseconds - tapStartedAt) / 1_000_000
+                print(String(format: "PLAY PERF tap -> already playing: %.1fms", duration))
+                return
+            }
+            resume()
             let duration = Double(DispatchTime.now().uptimeNanoseconds - tapStartedAt) / 1_000_000
             print(String(format: "PLAY PERF tap -> resume: %.1fms", duration))
             return
@@ -2082,12 +2130,12 @@ private struct MusicBrainzRelease: Decodable {
         historyIndex = 0
         manualQueueIDs.removeAll()
         queue = resolvedContext
-        load(song, recordHistory: false)
+        load(song, recordHistory: false, startAt: 0)
         let duration = Double(DispatchTime.now().uptimeNanoseconds - tapStartedAt) / 1_000_000
         print(String(format: "PLAY PERF tap -> play() called: %.1fms, context IDs: %d", duration, playbackContextIDs.count))
     }
 
-    private func load(_ song: Song, recordHistory: Bool) {
+    private func load(_ song: Song, recordHistory: Bool, startAt: Double? = nil) {
         if recordHistory {
             if historyIndex < playbackHistory.count - 1 {
                 playbackHistory = Array(playbackHistory.prefix(historyIndex + 1))
@@ -2096,9 +2144,19 @@ private struct MusicBrainzRelease: Decodable {
             historyIndex = playbackHistory.count - 1
         }
         let startedAt = DispatchTime.now().uptimeNanoseconds
-        currentSong = song; duration = song.duration; elapsed = 0
-        let url = store?.documentURL(for: song.fileName)
-        guard let url else { return }
+        guard let store else {
+            handleMissingFile(for: song)
+            return
+        }
+        let url = store.localURL(for: song)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            handleMissingFile(for: song)
+            return
+        }
+        currentSong = song
+        duration = song.duration
+        let requestedPosition = startAt ?? 0
+        elapsed = clampedPosition(requestedPosition, for: song)
         player?.pause()
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         if let endObserver {
@@ -2108,6 +2166,9 @@ private struct MusicBrainzRelease: Decodable {
         let item = AVPlayerItem(url: url); player = AVPlayer(playerItem: item); player?.rate = speed
         timeObserver = player?.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in self?.elapsed = time.seconds }
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in self?.advance() }
+        if elapsed > 0 {
+            player?.seek(to: CMTime(seconds: elapsed, preferredTimescale: 600))
+        }
         updateNowPlaying()
         player?.play()
         isPlaying = true
@@ -2116,8 +2177,23 @@ private struct MusicBrainzRelease: Decodable {
         if duration > 30 { print(String(format: "PERF player setup: %.1fms", duration)) }
     }
     func toggle() { isPlaying ? pause() : resume() }
-    func pause() { player?.pause(); isPlaying = false; store?.savedPosition = elapsed; store?.scheduleSave(); updateNowPlaying() }
-    func resume() { player?.play(); isPlaying = true; updateNowPlaying() }
+    func persistPosition() {
+        guard currentSong != nil else { return }
+        store?.savedPosition = elapsed
+        store?.scheduleSave()
+    }
+
+    func pause() { player?.pause(); isPlaying = false; persistPosition(); updateNowPlaying() }
+    func resume() {
+        guard let currentSong else { return }
+        if hasLoadedCurrentSong {
+            player?.play()
+            isPlaying = true
+            updateNowPlaying()
+        } else {
+            load(currentSong, recordHistory: false, startAt: store?.savedPosition ?? elapsed)
+        }
+    }
     func seek(to value: Double) { player?.seek(to: CMTime(seconds: value, preferredTimescale: 600)); elapsed = value; updateNowPlaying() }
     func previous() {
         if elapsed > 3 { seek(to: 0); return }
@@ -2190,7 +2266,10 @@ private struct MusicBrainzRelease: Decodable {
     }
     func setRate(_ rate: Float) { speed = rate; UserDefaults.standard.set(rate, forKey: "playbackSpeed"); player?.rate = isPlaying ? rate : 0; if !isPlaying { player?.pause() } }
     private func updateNowPlaying() {
-        guard let song = currentSong else { return }
+        guard let song = currentSong else {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            return
+        }
         let info: [String: Any] = [
             MPMediaItemPropertyTitle: song.title,
             MPMediaItemPropertyArtist: song.displayArtist,

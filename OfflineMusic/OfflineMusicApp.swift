@@ -4,6 +4,7 @@ import SwiftUI
 struct OfflineMusicApp: App {
     @StateObject private var store = MusicStore()
     @StateObject private var player = AudioPlayerService()
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         _ = PerformanceDiagnostics.launchStartedAt
@@ -22,6 +23,11 @@ struct OfflineMusicApp: App {
                     store.attach(player: player)
                     Task { @MainActor in
                         await store.reconcileDocumentsInBackground()
+                    }
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    if phase != .active {
+                        player.persistPosition()
                     }
                 }
         }
