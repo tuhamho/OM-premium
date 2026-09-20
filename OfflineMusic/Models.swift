@@ -1,6 +1,22 @@
 import Foundation
 import SwiftUI
 
+enum SearchNormalization {
+    static func value(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .replacingOccurrences(of: #"[^\p{L}\p{N}]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    static func matches(_ query: String, in fields: [String]) -> Bool {
+        let normalizedQuery = value(query)
+        guard !normalizedQuery.isEmpty else { return true }
+        return fields.contains { value($0).contains(normalizedQuery) }
+    }
+}
+
 struct Song: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
     var title: String

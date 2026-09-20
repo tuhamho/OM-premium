@@ -11,10 +11,11 @@ struct RootView: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             Group {
-                switch tab {
-                case 1: LibraryView()
-                case 2: PlaylistsView()
-                case 3: SettingsView()
+            switch tab {
+            case 1: LibraryView()
+            case 2: SearchView()
+            case 3: PlaylistsView()
+            case 4: SettingsView()
                 default: HomeView()
                 }
             }
@@ -26,8 +27,9 @@ struct RootView: View {
                 HStack {
                     tabButton("house.fill", "Home", 0)
                     tabButton("music.note.list", "Library", 1)
-                    tabButton("rectangle.stack.fill", "Playlists", 2)
-                    tabButton("gearshape.fill", "Settings", 3)
+                    tabButton("magnifyingglass", "Search", 2)
+                    tabButton("rectangle.stack.fill", "Playlists", 3)
+                    tabButton("gearshape.fill", "Settings", 4)
                 }
                 .padding(.top, 10).padding(.bottom, 8)
                 .background(.ultraThinMaterial)
@@ -230,6 +232,172 @@ struct LibraryView: View {
                 }
             }
         }
+    }
+}
+
+enum SearchScope: String, CaseIterable, Identifiable {
+    case all = "All"
+    case songs = "Songs"
+    case artists = "Artists"
+    case albums = "Albums"
+    case playlists = "Playlists"
+
+    var id: String { rawValue }
+}
+
+struct SearchView: View {
+    @EnvironmentObject private var store: MusicStore
+    @EnvironmentObject private var player: AudioPlayerService
+    @State private var query = ""
+    @State private var scope: SearchScope = .all
+    @State private var recentSearches: [String] = UserDefaults.standard.stringArray(forKey: "recentSearches") ?? []
+    @State private var debounceTask: Task<Void, Never>?
+
+    private var normalizedQuery: String { SearchNormalization.value(query) }
+    private var matchingSongs: [Song] {
+        guard !normalizedQuery.isEmpty else { return [] }
+        return store.songs.filter {
+            SearchNormalization.matches(query, in: [
+                $0.title, $0.artist, $0.album, $0.albumArtist, $0.genre, $0.fileName
+            ])
+        }
+    }
+    private var matchingArtists: [ArtistGroup] {
+        guard !normalizedQuery.isEmpty else { return [] }
+        return store.artistGroups.filter { SearchNormalization.matches(query, in: [$0.name]) }
+    }
+    private var matchingAlbums: [AlbumGroup] {
+        guard !normalizedQuery.isEmpty else { return [] }
+        return store.albumGroups.filter { SearchNormalization.matches(query, in: [$0.name, $0.artist]) }
+    }
+    private var matchingPlaylists: [Playlist] {
+        guard !normalizedQuery.isEmpty else { return [] }
+        return store.playlists.filter { SearchNormalization.matches(query, in: [$0.name]) }
+    }
+    private var hasResults: Bool {
+        switch scope {
+        case .all: return !matchingSongs.isEmpty || !matchingArtists.isEmpty || !matchingAlbums.isEmpty || !matchingPlaylists.isEmpty
+        case .songs: return !matchingSongs.isEmpty
+        case .artists: return !matchingArtists.isEmpty
+        case .albums: return !matchingAlbums.isEmpty
+        case .playlists: return !matchingPlaylists.isEmpty
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("Search").font(.largeTitle.bold())
+                    Picker("Search scope", selection: $scope) {
+                        ForEach(SearchScope.allCases) { value in
+                            Text(value.rawValue).tag(value)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    if normalizedQuery.isEmpty {
+                        recentSearchesView
+                    } else if !hasResults {
+                        ContentUnavailableView("No results found", systemImage: "magnifyingglass")
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        resultSections
+                    }
+                }
+                .padding(20)
+            }
+            .background(Color.ink)
+            .searchable(text: $query, prompt: "Songs, artists, albums")
+            .onSubmit(of: .search) { saveRecentSearch() }
+            .onChange(of: query) { _, _ in
+                debounceTask?.cancel()
+                debounceTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(250))
+                    guard !Task.isCancelled else { return }
+                    if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { saveRecentSearch() }
+                }
+            }
+            .onDisappear { debounceTask?.cancel() }
+            .navigationTitle("Search")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    @ViewBuilder private var recentSearchesView: some View {
+        if recentSearches.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Search your library").font(.title3.bold())
+                Text("Find songs, artists, albums, playlists, and filenames.").foregroundStyle(Color.muted)
+            }
+        } else {
+            HStack {
+                Text("Recent Searches").font(.title3.bold())
+                Spacer()
+                Button("Clear") {
+                    recentSearches.removeAll()
+                    UserDefaults.standard.removeObject(forKey: "recentSearches")
+                }
+                .font(.subheadline)
+            }
+            ForEach(recentSearches, id: \.self) { term in
+                Button {
+                    query = term
+                } label: {
+                    Label(term, systemImage: "clock.arrow.circlepath")
+                        .foregroundStyle(.white)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var resultSections: some View {
+        if (scope == .all || scope == .songs), !matchingSongs.isEmpty {
+            resultSection("Songs") {
+                ForEach(matchingSongs) { song in
+                    SongRow(song: song) { player.play(song, from: matchingSongs) }
+                }
+            }
+        }
+        if (scope == .all || scope == .artists), !matchingArtists.isEmpty {
+            resultSection("Artists") {
+                ForEach(matchingArtists) { group in
+                    NavigationLink { ArtistDetailView(artist: group.name) } label: { ArtistGroupRow(group: group) }
+                }
+            }
+        }
+        if (scope == .all || scope == .albums), !matchingAlbums.isEmpty {
+            resultSection("Albums") {
+                ForEach(matchingAlbums) { group in
+                    NavigationLink { AlbumDetailView(group: group) } label: { AlbumGroupRow(group: group) }
+                }
+            }
+        }
+        if (scope == .all || scope == .playlists), !matchingPlaylists.isEmpty {
+            resultSection("Playlists") {
+                ForEach(matchingPlaylists) { playlist in
+                    NavigationLink { PlaylistDetail(playlist: playlist) } label: {
+                        Label(playlist.name, systemImage: "music.note.list")
+                    }
+                }
+            }
+        }
+    }
+
+    private func resultSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.title3.bold())
+            content()
+        }
+    }
+
+    private func saveRecentSearch() {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return }
+        recentSearches.removeAll { SearchNormalization.value($0) == SearchNormalization.value(term) }
+        recentSearches.insert(term, at: 0)
+        recentSearches = Array(recentSearches.prefix(10))
+        UserDefaults.standard.set(recentSearches, forKey: "recentSearches")
     }
 }
 
