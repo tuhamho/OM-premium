@@ -454,7 +454,7 @@ struct PlaylistDetail: View {
 struct SettingsView: View {
     @EnvironmentObject private var store: MusicStore
     @EnvironmentObject private var player: AudioPlayerService
-    private let playbackSpeeds: [Float] = [0.75, 1.0, 1.25, 1.5, 2.0]
+    private let playbackSpeeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
     @State private var showingResetConfirmation = false
 
     var body: some View {
@@ -552,7 +552,10 @@ struct SettingsView: View {
 struct NowPlayingView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var player: AudioPlayerService
+    @EnvironmentObject private var store: MusicStore
     @State private var showQueue = false
+    @State private var showLyrics = false
+    @State private var showSleepTimer = false
 
     var body: some View {
         NavigationStack {
@@ -585,6 +588,11 @@ struct NowPlayingView: View {
                         .foregroundStyle(player.repeatMode == .off ? .white : Color.lime)
                 }
                 .padding(.horizontal, 8)
+                HStack {
+                    Button { showLyrics = true } label: { Label("Lyrics", systemImage: "quote.bubble") }
+                    Spacer()
+                    Button { showSleepTimer = true } label: { Label(store.sleepTimer.remainingText ?? "Sleep Timer", systemImage: "moon.zzz") }
+                }
                 Spacer()
             }
             .padding(24).background(Color.ink)
@@ -594,11 +602,83 @@ struct NowPlayingView: View {
                 ToolbarItem(placement: .topBarTrailing) { Button { showQueue = true } label: { Image(systemName: "list.number") } }
             }
             .sheet(isPresented: $showQueue) { QueueView() }
+            .sheet(isPresented: $showLyrics) {
+                if let song = player.currentSong { LyricsView(songID: song.id) }
+            }
+            .sheet(isPresented: $showSleepTimer) { SleepTimerView() }
         }
     }
 
     private func time(_ value: Double) -> String {
         String(format: "%d:%02d", Int(value) / 60, Int(value) % 60)
+    }
+}
+
+struct SleepTimerView: View {
+    @EnvironmentObject private var store: MusicStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(SleepTimerOption.allCases) { option in
+                    Button {
+                        store.sleepTimer.set(option)
+                        dismiss()
+                    } label: {
+                        HStack {
+                            Text(option.rawValue)
+                            Spacer()
+                            if store.sleepTimer.option == option { Image(systemName: "checkmark") }
+                        }
+                    }
+                }
+                if let remaining = store.sleepTimer.remainingText {
+                    Text("Remaining: \(remaining)").foregroundStyle(Color.muted)
+                }
+            }
+            .navigationTitle("Sleep Timer")
+        }
+    }
+}
+
+struct LyricsView: View {
+    @EnvironmentObject private var store: MusicStore
+    @Environment(\.dismiss) private var dismiss
+    let songID: UUID
+    @State private var editing = false
+    @State private var draft = ""
+
+    private var song: Song? { store.song(songID) }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if editing {
+                    TextEditor(text: $draft).padding()
+                } else if let lyrics = song?.lyrics {
+                    ScrollView { Text(lyrics).frame(maxWidth: .infinity, alignment: .leading).padding() }
+                } else {
+                    ContentUnavailableView("No lyrics available", systemImage: "quote.bubble")
+                }
+            }
+            .navigationTitle(song?.title ?? "Lyrics")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(editing ? "Save" : "Edit") {
+                        if editing { store.updateLyrics(for: songID, manualLyrics: draft) }
+                        editing.toggle()
+                    }
+                }
+                if editing, song?.manualLyrics != nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Clear Override") { store.updateLyrics(for: songID, manualLyrics: nil); draft = song?.embeddedLyrics ?? "" }
+                    }
+                }
+            }
+            .onAppear { draft = song?.lyrics ?? "" }
+        }
     }
 }
 
@@ -626,7 +706,12 @@ struct QueueView: View {
             .environment(\.editMode, .constant(.active))
             .scrollContentBackground(.hidden).background(Color.ink)
             .navigationTitle("Queue")
-            .toolbar { EditButton() }
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { EditButton() }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Clear") { player.clearQueue() }
+                }
+            }
         }
     }
 }
@@ -675,6 +760,7 @@ struct SongRow: View {
     let song: Song
     var play: () -> Void
     @EnvironmentObject private var store: MusicStore
+    @EnvironmentObject private var player: AudioPlayerService
 
     var body: some View {
         Button(action: play) {
@@ -691,6 +777,12 @@ struct SongRow: View {
         .listRowBackground(Color.clear)
         .buttonStyle(.plain)
         .contextMenu {
+            Button { player.playNext(song) } label: {
+                Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+            }
+            Button { player.addToQueue(song) } label: {
+                Label("Add to Queue", systemImage: "text.badge.plus")
+            }
             Button {
                 store.startSongDebug(song)
             } label: {

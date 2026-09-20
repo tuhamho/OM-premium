@@ -31,6 +31,7 @@ import UIKit
     private let fm = FileManager.default
     private weak var player: AudioPlayerService?
     private var enrichmentRunID = UUID()
+    let sleepTimer = SleepTimerManager()
 
     init() {
         let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -473,6 +474,83 @@ import UIKit
     func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; save() }
     func addPlaylist(name: String) { playlists.append(Playlist(name: name)); save() }
     func songs(in playlist: Playlist) -> [Song] { playlist.songIDs.compactMap(song) }
+
+    var recentlyAddedSongs: [Song] { songs.sorted { $0.importedAt > $1.importedAt } }
+    var mostPlayedSongs: [Song] { songs.sorted { $0.playCount > $1.playCount } }
+    var favoriteSongs: [Song] { songs.filter(\.isFavorite) }
+    var recentlyPlayedSongs: [Song] { recentlyPlayed.compactMap(song) }
+
+    func updateLyrics(for id: UUID, manualLyrics: String?) {
+        guard let index = songs.firstIndex(where: { $0.id == id }) else { return }
+        songs[index].manualLyrics = manualLyrics?.trimmingCharacters(in: .whitespacesAndNewlines)
+        save()
+        objectWillChange.send()
+        player?.syncCurrentSong(songs[index])
+    }
+}
+
+enum SleepTimerOption: String, CaseIterable, Identifiable {
+    case off = "Off"
+    case minutes15 = "15 minutes"
+    case minutes30 = "30 minutes"
+    case minutes45 = "45 minutes"
+    case minutes60 = "60 minutes"
+    case endOfSong = "End of current song"
+
+    var id: String { rawValue }
+    var duration: TimeInterval? {
+        switch self {
+        case .off, .endOfSong: return nil
+        case .minutes15: return 15 * 60
+        case .minutes30: return 30 * 60
+        case .minutes45: return 45 * 60
+        case .minutes60: return 60 * 60
+        }
+    }
+}
+
+@MainActor final class SleepTimerManager: ObservableObject {
+    @Published private(set) var option: SleepTimerOption = .off
+    @Published private(set) var remaining: TimeInterval?
+    private var task: Task<Void, Never>?
+    private var pausePlayback: (() -> Void)?
+
+    func attach(pausePlayback: @escaping () -> Void) {
+        self.pausePlayback = pausePlayback
+    }
+
+    func set(_ option: SleepTimerOption) {
+        task?.cancel()
+        self.option = option
+        remaining = option.duration
+        guard let duration = option.duration else { return }
+        task = Task { @MainActor [weak self] in
+            let deadline = Date().addingTimeInterval(duration)
+            while !Task.isCancelled {
+                let value = deadline.timeIntervalSinceNow
+                guard value > 0 else { break }
+                self?.remaining = value
+                try? await Task.sleep(for: .seconds(1))
+            }
+            guard !Task.isCancelled else { return }
+            self?.remaining = 0
+            self?.option = .off
+            self?.pausePlayback?()
+        }
+    }
+
+    func currentSongEnded() -> Bool {
+        guard option == .endOfSong else { return false }
+        option = .off
+        remaining = nil
+        pausePlayback?()
+        return true
+    }
+
+    var remainingText: String? {
+        guard let remaining else { return nil }
+        return String(format: "%02d:%02d", Int(remaining) / 60, Int(remaining) % 60)
+    }
 }
 
 private struct PersistedState: Codable {
@@ -516,6 +594,7 @@ struct MetadataService {
         let artist = value(.commonIdentifierArtist).isEmpty ? fallbackArtist : value(.commonIdentifierArtist)
         let album = value(.commonIdentifierAlbumName).isEmpty ? "Unknown Album" : value(.commonIdentifierAlbumName)
         let albumArtist = value(containing: "albumartist").isEmpty ? artist : value(containing: "albumartist")
+        let lyrics = value(containing: "lyrics")
         let artwork = items.first {
             $0.commonKey == .commonKeyArtwork || ($0.identifier?.rawValue.localizedCaseInsensitiveContains("artwork") == true)
         }?.dataValue
@@ -525,6 +604,7 @@ struct MetadataService {
             artist: artist.isEmpty ? "Unknown Artist" : artist,
             album: album,
             albumArtist: albumArtist,
+            embeddedLyrics: lyrics.isEmpty ? nil : lyrics,
             duration: duration.isFinite ? duration : 0,
             fileName: fileName,
             artworkData: artwork
@@ -1210,7 +1290,7 @@ private struct MusicBrainzRelease: Decodable {
     @Published var queue: [Song] = []
     @Published var repeatMode: RepeatMode = .off
     @Published var shuffle = false
-    @Published var speed: Float = 1
+    @Published var speed: Float = UserDefaults.standard.object(forKey: "playbackSpeed") as? Float ?? 1
 
     private var player: AVPlayer?
     private weak var store: MusicStore?
@@ -1220,6 +1300,7 @@ private struct MusicBrainzRelease: Decodable {
 
     func configure(with store: MusicStore) {
         self.store = store
+        store.sleepTimer.attach { [weak self] in self?.pause() }
         if store.resumeSession, let restored = store.song(store.currentSongID) { currentSong = restored; duration = restored.duration; elapsed = store.savedPosition }
         configureAudioSession(); configureRemoteCommands()
     }
@@ -1248,9 +1329,11 @@ private struct MusicBrainzRelease: Decodable {
     func seek(to value: Double) { player?.seek(to: CMTime(seconds: value, preferredTimescale: 600)); elapsed = value; updateNowPlaying() }
     func previous() { if elapsed > 3 { seek(to: 0); return }; guard let id = history.last, let song = store?.song(id) else { seek(to: 0); return }; play(song) }
     func next() { advance() }
-    private func advance() { guard let current = currentSong else { return }; if repeatMode == .one { seek(to: 0); resume(); return }; if let index = queue.firstIndex(where: { $0.id == current.id }), index + 1 < queue.count { history.append(current.id); play(queue[index + 1]) } else if repeatMode == .all, let first = queue.first { play(first) } else { pause(); seek(to: 0) } }
+    private func advance() { guard let current = currentSong else { return }; if store?.sleepTimer.currentSongEnded() == true { return }; if repeatMode == .one { seek(to: 0); resume(); return }; if let index = queue.firstIndex(where: { $0.id == current.id }), index + 1 < queue.count { history.append(current.id); play(queue[index + 1]) } else if repeatMode == .all, let first = queue.first { play(first) } else { pause(); seek(to: 0) } }
     func addToQueue(_ song: Song) { if !queue.contains(song) { queue.append(song) } }
-    func setRate(_ rate: Float) { speed = rate; player?.rate = isPlaying ? rate : 0; if !isPlaying { player?.pause() } }
+    func playNext(_ song: Song) { queue.removeAll { $0.id == song.id }; if let currentSong, let index = queue.firstIndex(where: { $0.id == currentSong.id }) { queue.insert(song, at: index + 1) } else { queue.insert(song, at: 0) } }
+    func clearQueue() { if let currentSong { queue = [currentSong] } else { queue.removeAll() } }
+    func setRate(_ rate: Float) { speed = rate; UserDefaults.standard.set(rate, forKey: "playbackSpeed"); player?.rate = isPlaying ? rate : 0; if !isPlaying { player?.pause() } }
     private func updateNowPlaying() { guard let song = currentSong else { return }; var info: [String: Any] = [MPMediaItemPropertyTitle: song.title, MPMediaItemPropertyArtist: song.displayArtist, MPMediaItemPropertyAlbumTitle: song.displayAlbum, MPMediaItemPropertyPlaybackDuration: max(duration, song.duration), MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed, MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? speed : 0]; if let data = song.artworkData, let image = UIImage(data: data) { info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image } }; MPNowPlayingInfoCenter.default().nowPlayingInfo = info }
     private func configureRemoteCommands() { let c = MPRemoteCommandCenter.shared(); c.playCommand.addTarget { [weak self] _ in self?.resume(); return .success }; c.pauseCommand.addTarget { [weak self] _ in self?.pause(); return .success }; c.nextTrackCommand.addTarget { [weak self] _ in self?.next(); return .success }; c.previousTrackCommand.addTarget { [weak self] _ in self?.previous(); return .success }; c.changePlaybackPositionCommand.addTarget { [weak self] event in if let e = event as? MPChangePlaybackPositionCommandEvent { self?.seek(to: e.positionTime) }; return .success } }
 }

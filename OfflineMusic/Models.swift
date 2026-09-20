@@ -8,6 +8,8 @@ struct Song: Identifiable, Codable, Hashable {
     var album: String
     var albumArtist: String = ""
     var musicBrainzReleaseID: String?
+    var embeddedLyrics: String?
+    var manualLyrics: String?
     var genre: String = ""
     var year: Int?
     var duration: Double = 0
@@ -18,13 +20,15 @@ struct Song: Identifiable, Codable, Hashable {
     var playCount: Int = 0
     var isFavorite: Bool = false
 
-    init(id: UUID = UUID(), title: String, artist: String, album: String, albumArtist: String = "", musicBrainzReleaseID: String? = nil, genre: String = "", year: Int? = nil, duration: Double = 0, fileName: String, artworkData: Data? = nil, importedAt: Date = .now, lastPlayed: Date? = nil, playCount: Int = 0, isFavorite: Bool = false) {
+    init(id: UUID = UUID(), title: String, artist: String, album: String, albumArtist: String = "", musicBrainzReleaseID: String? = nil, embeddedLyrics: String? = nil, manualLyrics: String? = nil, genre: String = "", year: Int? = nil, duration: Double = 0, fileName: String, artworkData: Data? = nil, importedAt: Date = .now, lastPlayed: Date? = nil, playCount: Int = 0, isFavorite: Bool = false) {
         self.id = id
         self.title = title
         self.artist = artist
         self.album = album
         self.albumArtist = albumArtist
         self.musicBrainzReleaseID = musicBrainzReleaseID
+        self.embeddedLyrics = embeddedLyrics
+        self.manualLyrics = manualLyrics
         self.genre = genre
         self.year = year
         self.duration = duration
@@ -37,7 +41,7 @@ struct Song: Identifiable, Codable, Hashable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, artist, album, albumArtist, musicBrainzReleaseID, genre, year, duration, fileName, artworkData, importedAt, lastPlayed, playCount, isFavorite
+        case id, title, artist, album, albumArtist, musicBrainzReleaseID, embeddedLyrics, manualLyrics, genre, year, duration, fileName, artworkData, importedAt, lastPlayed, playCount, isFavorite
     }
 
     init(from decoder: Decoder) throws {
@@ -48,6 +52,8 @@ struct Song: Identifiable, Codable, Hashable {
         album = try container.decodeIfPresent(String.self, forKey: .album) ?? "Unknown Album"
         albumArtist = try container.decodeIfPresent(String.self, forKey: .albumArtist) ?? ""
         musicBrainzReleaseID = try container.decodeIfPresent(String.self, forKey: .musicBrainzReleaseID)
+        embeddedLyrics = try container.decodeIfPresent(String.self, forKey: .embeddedLyrics)
+        manualLyrics = try container.decodeIfPresent(String.self, forKey: .manualLyrics)
         genre = try container.decodeIfPresent(String.self, forKey: .genre) ?? ""
         year = try container.decodeIfPresent(Int.self, forKey: .year)
         duration = try container.decodeIfPresent(Double.self, forKey: .duration) ?? 0
@@ -67,6 +73,8 @@ struct Song: Identifiable, Codable, Hashable {
         try container.encode(album, forKey: .album)
         try container.encode(albumArtist, forKey: .albumArtist)
         try container.encodeIfPresent(musicBrainzReleaseID, forKey: .musicBrainzReleaseID)
+        try container.encodeIfPresent(embeddedLyrics, forKey: .embeddedLyrics)
+        try container.encodeIfPresent(manualLyrics, forKey: .manualLyrics)
         try container.encode(genre, forKey: .genre)
         try container.encodeIfPresent(year, forKey: .year)
         try container.encode(duration, forKey: .duration)
@@ -80,6 +88,12 @@ struct Song: Identifiable, Codable, Hashable {
 
     var displayArtist: String { artist.isEmpty ? "Unknown Artist" : artist }
     var displayAlbum: String { album.isEmpty ? "Unknown Album" : album }
+    var lyrics: String? {
+        let manual = manualLyrics?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !manual.isEmpty { return manual }
+        let embedded = embeddedLyrics?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return embedded.isEmpty ? nil : embedded
+    }
     var durationText: String {
         let total = Int(duration.rounded())
         return String(format: "%d:%02d", total / 60, total % 60)
