@@ -295,11 +295,20 @@ enum PerformanceDiagnostics {
             let current = songsByID[event.songID] ?? (0, 0)
             songsByID[event.songID] = (current.plays + 1, current.seconds + event.listenedSeconds)
         }
-        snapshot.topSongs = songsByID.map { id, value in
-            ListeningSongStat(id: id, songID: id, plays: value.plays, listenedSeconds: value.seconds)
-        }.sorted {
-            $0.plays == $1.plays ? $0.listenedSeconds > $1.listenedSeconds : $0.plays > $1.plays
-        }.prefix(10).map { $0 }
+        var topSongs: [ListeningSongStat] = []
+        for (id, value) in songsByID {
+            topSongs.append(ListeningSongStat(
+                id: id,
+                songID: id,
+                plays: value.plays,
+                listenedSeconds: value.seconds
+            ))
+        }
+        topSongs.sort {
+            if $0.plays != $1.plays { return $0.plays > $1.plays }
+            return $0.listenedSeconds > $1.listenedSeconds
+        }
+        snapshot.topSongs = Array(topSongs.prefix(10))
 
         var artistsByKey: [String: (name: String, plays: Int, seconds: Double)] = [:]
         for event in qualifiedEvents {
@@ -308,11 +317,22 @@ enum PerformanceDiagnostics {
             let current = artistsByKey[key] ?? (displayArtistName(from: [Song(title: "", artist: artist, album: "", fileName: "")]), 0, 0)
             artistsByKey[key] = (current.name, current.plays + 1, current.seconds + event.listenedSeconds)
         }
-        snapshot.topArtists = artistsByKey.map { key, value in
-            ListeningArtistStat(id: key, name: value.name, plays: value.plays, listenedSeconds: value.seconds)
-        }.sorted {
-            $0.listenedSeconds == $1.listenedSeconds ? $0.plays > $1.plays : $0.listenedSeconds > $1.listenedSeconds
-        }.prefix(10).map { $0 }
+        var topArtists: [ListeningArtistStat] = []
+        for (key, value) in artistsByKey {
+            topArtists.append(ListeningArtistStat(
+                id: key,
+                name: value.name,
+                plays: value.plays,
+                listenedSeconds: value.seconds
+            ))
+        }
+        topArtists.sort {
+            if $0.listenedSeconds != $1.listenedSeconds {
+                return $0.listenedSeconds > $1.listenedSeconds
+            }
+            return $0.plays > $1.plays
+        }
+        snapshot.topArtists = Array(topArtists.prefix(10))
         return snapshot
     }
 
@@ -2346,11 +2366,26 @@ private struct MusicBrainzRelease: Decodable {
             self.endObserver = nil
         }
         let item = AVPlayerItem(url: url); player = AVPlayer(playerItem: item); player?.rate = speed
-        timeObserver = player?.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in
-            self?.accumulateListeningTime()
-            self?.elapsed = time.seconds
+        timeObserver = player?.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+            queue: .main
+        ) { [weak self] time in
+            let seconds = time.seconds
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.accumulateListeningTime()
+                self.elapsed = seconds
+            }
         }
-        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in self?.advance() }
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.advance()
+            }
+        }
         if elapsed > 0 {
             player?.seek(to: CMTime(seconds: elapsed, preferredTimescale: 600))
         }
@@ -2358,7 +2393,7 @@ private struct MusicBrainzRelease: Decodable {
         player?.play()
         isPlaying = true
         beginListeningSession(for: song)
-        store?.markPlayed(song.id)
+        store.markPlayed(song.id)
         let duration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
         if duration > 30 { print(String(format: "PERF player setup: %.1fms", duration)) }
     }
