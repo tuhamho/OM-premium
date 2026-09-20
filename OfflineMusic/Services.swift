@@ -712,6 +712,26 @@ import UIKit
     func markPlayed(_ id: UUID) { update(id) { $0.playCount += 1; $0.lastPlayed = .now }; recentlyPlayed.removeAll { $0 == id }; recentlyPlayed.insert(id, at: 0); recentlyPlayed = Array(recentlyPlayed.prefix(30)); currentSongID = id; save() }
     func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; save() }
     func addPlaylist(name: String) { playlists.append(Playlist(name: name)); save() }
+    func addSong(_ songID: UUID, to playlistID: UUID) {
+        guard let index = playlists.firstIndex(where: { $0.id == playlistID }),
+              songs.contains(where: { $0.id == songID }) else { return }
+        if !playlists[index].songIDs.contains(songID) {
+            playlists[index].songIDs.append(songID)
+            save()
+            objectWillChange.send()
+        }
+    }
+
+    func updateSongMetadata(for id: UUID, title: String, artist: String, album: String, albumArtist: String) {
+        guard let index = songs.firstIndex(where: { $0.id == id }) else { return }
+        songs[index].title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        songs[index].artist = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        songs[index].album = album.trimmingCharacters(in: .whitespacesAndNewlines)
+        songs[index].albumArtist = albumArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+        save()
+        objectWillChange.send()
+        player?.syncCurrentSong(songs[index])
+    }
     func songs(in playlist: Playlist) -> [Song] { playlist.songIDs.compactMap(song) }
 
     var recentlyAddedSongs: [Song] { songs.sorted { $0.importedAt > $1.importedAt } }
@@ -1932,12 +1952,25 @@ private struct MusicBrainzRelease: Decodable {
     private weak var store: MusicStore?
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
-    private var history: [UUID] = []
+    private var playbackContext: [Song] = []
+    private var randomPlayedIDs: Set<UUID> = []
+    private var playbackHistory: [UUID] = []
+    private var historyIndex = -1
+    private var manualQueueIDs: Set<UUID> = []
 
     func configure(with store: MusicStore) {
         self.store = store
         store.sleepTimer.attach { [weak self] in self?.pause() }
-        if store.resumeSession, let restored = store.song(store.currentSongID) { currentSong = restored; duration = restored.duration; elapsed = store.savedPosition }
+        if store.resumeSession, let restored = store.song(store.currentSongID) {
+            currentSong = restored
+            duration = restored.duration
+            elapsed = store.savedPosition
+            playbackContext = store.songs
+            randomPlayedIDs = [restored.id]
+            playbackHistory = [restored.id]
+            historyIndex = 0
+            queue = playbackContext
+        }
         configureAudioSession(); configureRemoteCommands()
     }
     func syncCurrentSong(_ song: Song) {
@@ -1948,8 +1981,28 @@ private struct MusicBrainzRelease: Decodable {
     private func configureAudioSession() { try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: []); try? AVAudioSession.sharedInstance().setActive(true) }
 
     func play(_ song: Song, from list: [Song]? = nil) {
-        if currentSong?.id == song.id { if !isPlaying { player?.play(); isPlaying = true }; return }
-        if let list { queue = list }
+        if currentSong?.id == song.id, list == nil {
+            if !isPlaying { player?.play(); isPlaying = true }
+            return
+        }
+        let context = deduplicated(list ?? [song])
+        playbackContext = context.isEmpty ? [song] : context
+        randomPlayedIDs = [song.id]
+        playbackHistory = [song.id]
+        historyIndex = 0
+        manualQueueIDs.removeAll()
+        queue = playbackContext
+        load(song, recordHistory: false)
+    }
+
+    private func load(_ song: Song, recordHistory: Bool) {
+        if recordHistory {
+            if historyIndex < playbackHistory.count - 1 {
+                playbackHistory = Array(playbackHistory.prefix(historyIndex + 1))
+            }
+            playbackHistory.append(song.id)
+            historyIndex = playbackHistory.count - 1
+        }
         currentSong = song; duration = song.duration; store?.markPlayed(song.id); elapsed = 0
         let url = store?.documentURL(for: song.fileName)
         guard let url else { return }
@@ -1963,12 +2016,74 @@ private struct MusicBrainzRelease: Decodable {
     func pause() { player?.pause(); isPlaying = false; store?.savedPosition = elapsed; store?.save(); updateNowPlaying() }
     func resume() { player?.play(); isPlaying = true; updateNowPlaying() }
     func seek(to value: Double) { player?.seek(to: CMTime(seconds: value, preferredTimescale: 600)); elapsed = value; updateNowPlaying() }
-    func previous() { if elapsed > 3 { seek(to: 0); return }; guard let id = history.last, let song = store?.song(id) else { seek(to: 0); return }; play(song) }
+    func previous() {
+        if elapsed > 3 { seek(to: 0); return }
+        guard historyIndex > 0 else { seek(to: 0); return }
+        historyIndex -= 1
+        guard let song = store?.song(playbackHistory[historyIndex]) else { seek(to: 0); return }
+        load(song, recordHistory: false)
+    }
     func next() { advance() }
-    private func advance() { guard let current = currentSong else { return }; if store?.sleepTimer.currentSongEnded() == true { return }; if repeatMode == .one { seek(to: 0); resume(); return }; if let index = queue.firstIndex(where: { $0.id == current.id }), index + 1 < queue.count { history.append(current.id); play(queue[index + 1]) } else if repeatMode == .all, let first = queue.first { play(first) } else { pause(); seek(to: 0) } }
-    func addToQueue(_ song: Song) { if !queue.contains(song) { queue.append(song) } }
-    func playNext(_ song: Song) { queue.removeAll { $0.id == song.id }; if let currentSong, let index = queue.firstIndex(where: { $0.id == currentSong.id }) { queue.insert(song, at: index + 1) } else { queue.insert(song, at: 0) } }
-    func clearQueue() { if let currentSong { queue = [currentSong] } else { queue.removeAll() } }
+    private func advance() {
+        guard let current = currentSong else { return }
+        if store?.sleepTimer.currentSongEnded() == true { return }
+        if repeatMode == .one { seek(to: 0); resume(); return }
+
+        if let next = nextManualSong(after: current) {
+            manualQueueIDs.remove(current.id)
+            load(next, recordHistory: true)
+            return
+        }
+
+        guard let next = nextRandomSong(excluding: current.id) else {
+            pause()
+            seek(to: 0)
+            return
+        }
+        randomPlayedIDs.insert(next.id)
+        load(next, recordHistory: true)
+    }
+
+    private func nextManualSong(after current: Song) -> Song? {
+        guard let index = queue.firstIndex(where: { $0.id == current.id }) else {
+            return queue.first(where: { manualQueueIDs.contains($0.id) })
+        }
+        return queue.dropFirst(index + 1).first(where: { manualQueueIDs.contains($0.id) })
+    }
+
+    private func nextRandomSong(excluding currentID: UUID) -> Song? {
+        let candidates = playbackContext.filter { $0.id != currentID && !randomPlayedIDs.contains($0.id) }
+        if let next = candidates.randomElement() { return next }
+        randomPlayedIDs = [currentID]
+        return playbackContext.filter { $0.id != currentID }.randomElement()
+    }
+
+    private func deduplicated(_ songs: [Song]) -> [Song] {
+        var seen = Set<UUID>()
+        return songs.filter { seen.insert($0.id).inserted }
+    }
+
+    func addToQueue(_ song: Song) {
+        guard !queue.contains(where: { $0.id == song.id }) else { return }
+        queue.append(song)
+        manualQueueIDs.insert(song.id)
+    }
+
+    func playNext(_ song: Song) {
+        queue.removeAll { $0.id == song.id }
+        manualQueueIDs.remove(song.id)
+        if let currentSong, let index = queue.firstIndex(where: { $0.id == currentSong.id }) {
+            queue.insert(song, at: index + 1)
+        } else {
+            queue.insert(song, at: 0)
+        }
+        manualQueueIDs.insert(song.id)
+    }
+
+    func clearQueue() {
+        manualQueueIDs.removeAll()
+        if let currentSong { queue = [currentSong] } else { queue.removeAll() }
+    }
     func setRate(_ rate: Float) { speed = rate; UserDefaults.standard.set(rate, forKey: "playbackSpeed"); player?.rate = isPlaying ? rate : 0; if !isPlaying { player?.pause() } }
     private func updateNowPlaying() { guard let song = currentSong else { return }; var info: [String: Any] = [MPMediaItemPropertyTitle: song.title, MPMediaItemPropertyArtist: song.displayArtist, MPMediaItemPropertyAlbumTitle: song.displayAlbum, MPMediaItemPropertyPlaybackDuration: max(duration, song.duration), MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed, MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? speed : 0]; if let data = song.artworkData, let image = UIImage(data: data) { info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image } }; MPNowPlayingInfoCenter.default().nowPlayingInfo = info }
     private func configureRemoteCommands() { let c = MPRemoteCommandCenter.shared(); c.playCommand.addTarget { [weak self] _ in self?.resume(); return .success }; c.pauseCommand.addTarget { [weak self] _ in self?.pause(); return .success }; c.nextTrackCommand.addTarget { [weak self] _ in self?.next(); return .success }; c.previousTrackCommand.addTarget { [weak self] _ in self?.previous(); return .success }; c.changePlaybackPositionCommand.addTarget { [weak self] event in if let e = event as? MPChangePlaybackPositionCommandEvent { self?.seek(to: e.positionTime) }; return .success } }

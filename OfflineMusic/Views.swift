@@ -100,7 +100,9 @@ struct HomeView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 14) {
                         ForEach(songs) { song in
-                            SongCard(song: song) { player.play(song, from: store.songs) }
+                            SongCard(song: song) {
+                                player.play(song, from: songs)
+                            }
                         }
                     }
                 }
@@ -1076,14 +1078,13 @@ struct SongCard: View {
             .frame(width: 142, alignment: .leading)
         }
         .buttonStyle(.plain)
+        .songActions(for: song, play: play)
     }
 }
 
 struct SongRow: View {
     let song: Song
     var play: () -> Void
-    @EnvironmentObject private var store: MusicStore
-    @EnvironmentObject private var player: AudioPlayerService
 
     var body: some View {
         Button(action: play) {
@@ -1099,17 +1100,138 @@ struct SongRow: View {
         }
         .listRowBackground(Color.clear)
         .buttonStyle(.plain)
-        .contextMenu {
-            Button { player.playNext(song) } label: {
-                Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+        .songActions(for: song, play: play)
+    }
+}
+
+private struct SongActionsModifier: ViewModifier {
+    @EnvironmentObject private var store: MusicStore
+    @EnvironmentObject private var player: AudioPlayerService
+    let song: Song
+    let play: () -> Void
+    @State private var showingEditor = false
+    @State private var showingPlaylistPicker = false
+
+    init(song: Song, play: @escaping () -> Void) {
+        self.song = song
+        self.play = play
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .contextMenu {
+                Button(action: play) {
+                    Label("Play", systemImage: "play.fill")
+                }
+                Button { player.playNext(song) } label: {
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+                Button { player.addToQueue(song) } label: {
+                    Label("Add to Queue", systemImage: "text.badge.plus")
+                }
+                Button { showingPlaylistPicker = true } label: {
+                    Label("Add to Playlist", systemImage: "rectangle.stack.badge.plus")
+                }
+                Button { store.toggleFavorite(song) } label: {
+                    Label(song.isFavorite ? "Remove Favorite" : "Favorite", systemImage: song.isFavorite ? "heart.slash" : "heart")
+                }
+                Button { showingEditor = true } label: {
+                    Label("Edit Info", systemImage: "pencil")
+                }
+                if let artistGroup = store.artistGroups.first(where: { $0.songs.contains(where: { $0.id == song.id }) }) {
+                    NavigationLink {
+                        ArtistDetailView(artist: artistGroup.name)
+                    } label: {
+                        Label("View Artist", systemImage: "person")
+                    }
+                }
+                if let albumGroup = store.albumGroups.first(where: { $0.songs.contains(where: { $0.id == song.id }) }) {
+                    NavigationLink {
+                        AlbumDetailView(group: albumGroup)
+                    } label: {
+                        Label("View Album", systemImage: "square.stack")
+                    }
+                }
+                Button { store.startSongDebug(song) } label: {
+                    Label("Identify & Fetch Artwork", systemImage: "wand.and.stars")
+                }
             }
-            Button { player.addToQueue(song) } label: {
-                Label("Add to Queue", systemImage: "text.badge.plus")
+            .sheet(isPresented: $showingEditor) {
+                SongEditorView(song: store.song(song.id) ?? song)
             }
-            Button {
-                store.startSongDebug(song)
-            } label: {
-                Label("Identify & Fetch Artwork", systemImage: "wand.and.stars")
+            .sheet(isPresented: $showingPlaylistPicker) {
+                PlaylistPickerView(songID: song.id)
+            }
+    }
+}
+
+private extension View {
+    func songActions(for song: Song, play: @escaping () -> Void) -> some View {
+        modifier(SongActionsModifier(song: song, play: play))
+    }
+}
+
+struct SongEditorView: View {
+    @EnvironmentObject private var store: MusicStore
+    @Environment(\.dismiss) private var dismiss
+    let songID: UUID
+    @State private var title: String
+    @State private var artist: String
+    @State private var album: String
+    @State private var albumArtist: String
+
+    init(song: Song) {
+        songID = song.id
+        _title = State(initialValue: song.title)
+        _artist = State(initialValue: song.artist)
+        _album = State(initialValue: song.album)
+        _albumArtist = State(initialValue: song.albumArtist)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Title", text: $title)
+                TextField("Artist", text: $artist)
+                TextField("Album", text: $album)
+                TextField("Album Artist", text: $albumArtist)
+            }
+            .navigationTitle("Edit Info")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") {
+                        store.updateSongMetadata(for: songID, title: title, artist: artist, album: album, albumArtist: albumArtist)
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct PlaylistPickerView: View {
+    @EnvironmentObject private var store: MusicStore
+    @Environment(\.dismiss) private var dismiss
+    let songID: UUID
+
+    var body: some View {
+        NavigationStack {
+            List(store.playlists) { playlist in
+                Button {
+                    store.addSong(songID, to: playlist.id)
+                    dismiss()
+                } label: {
+                    HStack {
+                        Text(playlist.name)
+                        Spacer()
+                        if playlist.songIDs.contains(songID) { Image(systemName: "checkmark") }
+                    }
+                }
+            }
+            .navigationTitle("Add to Playlist")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
             }
         }
     }
