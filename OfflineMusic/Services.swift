@@ -62,6 +62,11 @@ enum PerformanceDiagnostics {
     private var cachedHomeAlbums: [Song] = []
     private var cachedHomeFavorites: [Song] = []
     private var cachedHomeMostPlayed: [Song] = []
+    private var searchIndexByID: [UUID: SongSearchIndex] = [:]
+    private var metadataRevision = 0
+    private var groupingCacheRevision = -1
+    private var cachedArtistGroups: [ArtistGroup] = []
+    private var cachedAlbumGroups: [AlbumGroup] = []
     let sleepTimer = SleepTimerManager()
 
     init() {
@@ -120,6 +125,7 @@ enum PerformanceDiagnostics {
         guard let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
         let decodeDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead
         songs = state.songs; playlists = state.playlists; recentlyPlayed = state.recentlyPlayed; currentSongID = state.currentSongID; savedPosition = state.savedPosition
+        rebuildSearchIndex()
         listeningEvents = state.listeningEvents ?? []
         firstQualifiedListenIDs = Set(state.firstQualifiedListenIDs ?? [])
         discoverSongIDs = state.discoverSongIDs ?? []
@@ -184,6 +190,49 @@ enum PerformanceDiagnostics {
 
     private func invalidateHomeCache() {
         libraryRevision &+= 1
+    }
+
+    private func rebuildSearchIndex() {
+        searchIndexByID = Dictionary(uniqueKeysWithValues: songs.map { ($0.id, SongSearchIndex(song: $0)) })
+    }
+
+    private func updateSearchIndex(for song: Song) {
+        searchIndexByID[song.id] = SongSearchIndex(song: song)
+    }
+
+    private func markMetadataChanged() {
+        metadataRevision &+= 1
+    }
+
+    private func rebuildGroupingCacheIfNeeded() {
+        guard groupingCacheRevision != metadataRevision else { return }
+        let groupedArtists = Dictionary(grouping: songs) { artistKey(for: $0.displayArtist) }
+        cachedArtistGroups = groupedArtists.map { key, groupedSongs in
+            ArtistGroup(id: key, name: displayArtistName(from: groupedSongs), songs: sortSongs(groupedSongs))
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+        let groupedAlbums = Dictionary(grouping: songs) { song in
+            let artist = song.albumArtist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? song.displayArtist : song.albumArtist
+            let album = albumKey(for: song.displayAlbum)
+            if let releaseID = song.musicBrainzReleaseID, !releaseID.isEmpty { return "mb:\(releaseID)" }
+            return album == "unknown album" ? album : "\(artistKey(for: artist))\u{1F}\(album)"
+        }
+        cachedAlbumGroups = groupedAlbums.map { key, groupedSongs in
+            let first = groupedSongs[0]
+            let artist = first.albumArtist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? first.displayArtist : first.albumArtist
+            return AlbumGroup(id: key, name: displayAlbumName(from: groupedSongs), artist: artist.trimmingCharacters(in: .whitespacesAndNewlines), songs: sortSongs(groupedSongs))
+        }.sorted {
+            let albumOrder = $0.name.localizedCaseInsensitiveCompare($1.name)
+            return albumOrder == .orderedSame
+                ? $0.artist.localizedCaseInsensitiveCompare($1.artist) == .orderedAscending
+                : albumOrder == .orderedAscending
+        }
+        groupingCacheRevision = metadataRevision
+    }
+
+    func searchIndexSnapshot() -> [SongSearchIndex] {
+        if searchIndexByID.count != songs.count { rebuildSearchIndex() }
+        return songs.compactMap { searchIndexByID[$0.id] }
     }
 
     private func rebuildHomeCacheIfNeeded() {
@@ -376,7 +425,8 @@ enum PerformanceDiagnostics {
                 imported += 1
             } catch { continue }
         }
-        if imported > 0 { invalidateHomeCache(); ensureDailyDiscover() }
+        if imported > 0 { markMetadataChanged(); invalidateHomeCache(); ensureDailyDiscover() }
+        if imported > 0 { rebuildSearchIndex() }
         save()
         return imported
     }
@@ -454,6 +504,8 @@ enum PerformanceDiagnostics {
         }
 
         if !removedIDs.isEmpty || added > 0 || modified > 0 {
+            markMetadataChanged()
+            rebuildSearchIndex()
             invalidateHomeCache()
             ensureDailyDiscover()
             save()
@@ -530,6 +582,8 @@ enum PerformanceDiagnostics {
         }
 
         save()
+        markMetadataChanged()
+        rebuildSearchIndex()
         invalidateHomeCache()
         ensureDailyDiscover()
         isScanning = false
@@ -540,6 +594,8 @@ enum PerformanceDiagnostics {
     private func removeSongs(_ ids: [UUID]) {
         let removed = Set(ids)
         songs.removeAll { removed.contains($0.id) }
+        markMetadataChanged()
+        removed.forEach { searchIndexByID.removeValue(forKey: $0) }
         recentlyPlayed.removeAll { removed.contains($0) }
         playlists.indices.forEach { index in
             playlists[index].songIDs.removeAll { removed.contains($0) }
@@ -693,6 +749,10 @@ enum PerformanceDiagnostics {
         }
 
         songs[index] = updated
+        if updated.title != original.title || updated.artist != original.artist || updated.album != original.album || updated.albumArtist != original.albumArtist || updated.genre != original.genre || updated.fileName != original.fileName || updated.musicBrainzReleaseID != original.musicBrainzReleaseID {
+            markMetadataChanged()
+            updateSearchIndex(for: updated)
+        }
         invalidateHomeCache()
         objectWillChange.send()
         save()
@@ -719,6 +779,8 @@ enum PerformanceDiagnostics {
             local.lyricsOffset = existing.lyricsOffset
             songs[index] = local
         }
+        markMetadataChanged()
+        rebuildSearchIndex()
         invalidateHomeCache()
         save()
         objectWillChange.send()
@@ -754,7 +816,13 @@ enum PerformanceDiagnostics {
     func toggleFavorite(_ song: Song) { update(song.id) { $0.isFavorite.toggle() }; save() }
     func update(_ id: UUID, _ change: (inout Song) -> Void) {
         guard let i = songs.firstIndex(where: { $0.id == id }) else { return }
+        let before = songs[i]
         change(&songs[i])
+        let after = songs[i]
+        if before.title != after.title || before.artist != after.artist || before.album != after.album || before.albumArtist != after.albumArtist || before.genre != after.genre || before.fileName != after.fileName {
+            markMetadataChanged()
+            updateSearchIndex(for: after)
+        }
         invalidateHomeCache()
         objectWillChange.send()
     }
@@ -868,43 +936,13 @@ enum PerformanceDiagnostics {
             .lowercased()
     }
     var artistGroups: [ArtistGroup] {
-        let grouped = Dictionary(grouping: songs) { artistKey(for: $0.displayArtist) }
-        return grouped.map { key, songs in
-            let sortedSongs = sortSongs(songs)
-            return ArtistGroup(
-                id: key,
-                name: displayArtistName(from: songs),
-                songs: sortedSongs
-            )
-        }
-        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        rebuildGroupingCacheIfNeeded()
+        return cachedArtistGroups
     }
 
     var albumGroups: [AlbumGroup] {
-        let grouped = Dictionary(grouping: songs) { song in
-            let artist = song.albumArtist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? song.displayArtist : song.albumArtist
-            let album = albumKey(for: song.displayAlbum)
-            if let releaseID = song.musicBrainzReleaseID, !releaseID.isEmpty {
-                return "mb:\(releaseID)"
-            }
-            return album == "unknown album" ? album : "\(artistKey(for: artist))\u{1F}\(album)"
-        }
-        return grouped.map { key, songs in
-            let first = songs[0]
-            let artist = first.albumArtist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? first.displayArtist : first.albumArtist
-            return AlbumGroup(
-                id: key,
-                name: displayAlbumName(from: songs),
-                artist: artist.trimmingCharacters(in: .whitespacesAndNewlines),
-                songs: sortSongs(songs)
-            )
-        }
-        .sorted {
-            let albumOrder = $0.name.localizedCaseInsensitiveCompare($1.name)
-            return albumOrder == .orderedSame
-                ? $0.artist.localizedCaseInsensitiveCompare($1.artist) == .orderedAscending
-                : albumOrder == .orderedAscending
-        }
+        rebuildGroupingCacheIfNeeded()
+        return cachedAlbumGroups
     }
 
     func songs(forArtist name: String) -> [Song] {
@@ -948,7 +986,7 @@ enum PerformanceDiagnostics {
         }
     }
     func markPlayed(_ id: UUID) { update(id) { $0.playCount += 1; $0.lastPlayed = .now }; recentlyPlayed.removeAll { $0 == id }; recentlyPlayed.insert(id, at: 0); recentlyPlayed = Array(recentlyPlayed.prefix(30)); currentSongID = id; scheduleSave() }
-    func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; invalidateHomeCache(); save() }
+    func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; searchIndexByID.removeValue(forKey: song.id); playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; invalidateHomeCache(); save() }
     func addPlaylist(name: String) { playlists.append(Playlist(name: name)); save() }
     func addSong(_ songID: UUID, to playlistID: UUID) {
         guard let index = playlists.firstIndex(where: { $0.id == playlistID }),
@@ -966,6 +1004,8 @@ enum PerformanceDiagnostics {
         songs[index].artist = artist.trimmingCharacters(in: .whitespacesAndNewlines)
         songs[index].album = album.trimmingCharacters(in: .whitespacesAndNewlines)
         songs[index].albumArtist = albumArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+        markMetadataChanged()
+        updateSearchIndex(for: songs[index])
         invalidateHomeCache()
         save()
         objectWillChange.send()

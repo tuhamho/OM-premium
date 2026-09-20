@@ -17,6 +17,32 @@ enum SearchNormalization {
     }
 }
 
+struct SongSearchIndex: Hashable, Sendable {
+    let songID: UUID
+    let normalizedTitle: String
+    let normalizedArtist: String
+    let normalizedAlbum: String
+    let normalizedAlbumArtist: String
+    let normalizedGenre: String
+    let normalizedFilename: String
+    let combinedText: String
+    let isFavorite: Bool
+
+    init(song: Song) {
+        songID = song.id
+        normalizedTitle = SearchNormalization.value(song.title)
+        normalizedArtist = SearchNormalization.value(song.displayArtist)
+        normalizedAlbum = SearchNormalization.value(song.displayAlbum)
+        normalizedAlbumArtist = SearchNormalization.value(song.albumArtist)
+        normalizedGenre = SearchNormalization.value(song.genre)
+        normalizedFilename = SearchNormalization.value(song.fileName)
+        combinedText = [song.title, song.displayArtist, song.displayAlbum, song.albumArtist, song.genre, song.fileName]
+            .map(SearchNormalization.value)
+            .joined(separator: " ")
+        isFavorite = song.isFavorite
+    }
+}
+
 struct SongFileFingerprint: Codable, Hashable, Sendable {
     let relativePath: String
     let fileSize: Int64

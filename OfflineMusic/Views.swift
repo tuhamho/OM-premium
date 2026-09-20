@@ -231,17 +231,16 @@ struct LibraryView: View {
     @State private var filter: LibraryFilter = .songs
     @State private var sort: SortMode = .recentlyAdded
     @State private var importing = false
+    @State private var searchResultIDs: [UUID] = []
+    @State private var searchTask: Task<Void, Never>?
+    @State private var searchGeneration = 0
 
     private var filtered: [Song] {
-        var result = store.songs
+        let resultIDs = Set(searchResultIDs)
+        var result = search.isEmpty
+            ? store.songs
+            : store.songs.filter { resultIDs.contains($0.id) }
         if filter == .favorites { result = result.filter(\.isFavorite) }
-        if !search.isEmpty {
-            result = result.filter {
-                SearchNormalization.matches(search, in: [
-                    $0.title, $0.artist, $0.album, $0.albumArtist, $0.genre, $0.fileName
-                ])
-            }
-        }
         switch sort {
         case .title: result.sort { $0.title < $1.title }
         case .artist: result.sort { $0.artist < $1.artist }
@@ -255,17 +254,66 @@ struct LibraryView: View {
 
     private var visibleArtistGroups: [ArtistGroup] {
         guard !search.isEmpty else { return store.artistGroups }
+        let normalizedQuery = SearchNormalization.value(search)
+        let matchingSongIDs = Set(searchResultIDs)
         return store.artistGroups.filter { group in
-            group.name.localizedCaseInsensitiveContains(search) ||
-            group.songs.contains { $0.title.localizedCaseInsensitiveContains(search) || $0.album.localizedCaseInsensitiveContains(search) }
+            SearchNormalization.value(group.name).contains(normalizedQuery) ||
+            group.songs.contains { matchingSongIDs.contains($0.id) }
         }
     }
 
     private var visibleAlbumGroups: [AlbumGroup] {
         guard !search.isEmpty else { return store.albumGroups }
+        let normalizedQuery = SearchNormalization.value(search)
+        let matchingSongIDs = Set(searchResultIDs)
         return store.albumGroups.filter {
-            $0.name.localizedCaseInsensitiveContains(search) ||
-            $0.artist.localizedCaseInsensitiveContains(search)
+            SearchNormalization.value($0.name).contains(normalizedQuery) ||
+            SearchNormalization.value($0.artist).contains(normalizedQuery) ||
+            $0.songs.contains { matchingSongIDs.contains($0.id) }
+        }
+    }
+
+    private func scheduleSearch(_ query: String) {
+        searchTask?.cancel()
+        searchGeneration += 1
+        let generation = searchGeneration
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else {
+            searchResultIDs = []
+            return
+        }
+
+        let snapshot = store.searchIndexSnapshot()
+        let selectedFilter = filter
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        searchTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: 180_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            let ids = await Task.detached(priority: .userInitiated) {
+                let normalizedQuery = SearchNormalization.value(trimmedQuery)
+                return snapshot.compactMap { entry -> UUID? in
+                    if selectedFilter == .favorites, !entry.isFavorite { return nil }
+                    let searchableText: String
+                    switch selectedFilter {
+                    case .artists:
+                        searchableText = [entry.normalizedArtist, entry.normalizedTitle, entry.normalizedAlbum].joined(separator: " ")
+                    case .albums:
+                        searchableText = [entry.normalizedAlbum, entry.normalizedAlbumArtist, entry.normalizedArtist, entry.normalizedTitle].joined(separator: " ")
+                    default:
+                        searchableText = entry.combinedText
+                    }
+                    guard searchableText.contains(normalizedQuery) else { return nil }
+                    return entry.songID
+                }
+            }.value
+            guard !Task.isCancelled, generation == searchGeneration else { return }
+            searchResultIDs = ids
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+            print(String(format: "SEARCH PERF songs: %d, query: \"%@\", indexed filter + publish: %.1fms", snapshot.count, trimmedQuery, elapsed))
         }
     }
 
@@ -375,6 +423,9 @@ struct LibraryView: View {
                     Task { _ = await store.importFiles(urls) }
                 }
             }
+            .task { scheduleSearch(search) }
+            .onChange(of: search) { _, value in scheduleSearch(value) }
+            .onChange(of: filter) { _, _ in scheduleSearch(search) }
         }
     }
 }
