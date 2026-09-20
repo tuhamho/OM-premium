@@ -506,21 +506,6 @@ struct SettingsView: View {
                     }
                     .disabled(store.isFetchingArtwork || store.songs.isEmpty)
 
-                    Button("Fetch Missing Lyrics") {
-                        store.startMissingLyricsFetch()
-                    }
-                    .disabled(store.isFetchingLyrics || store.songs.isEmpty)
-                    if store.isFetchingLyrics {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ProgressView()
-                            Text("Fetching Lyrics \(store.lyricsFetchProgress) / \(store.lyricsFetchTotal)")
-                            Text("Current: \(store.lyricsFetchCurrent)")
-                            Button("Cancel") { store.cancelMissingLyricsFetch() }
-                        }
-                    } else if !store.lyricsFetchSummary.isEmpty {
-                        Text(store.lyricsFetchSummary).foregroundStyle(Color.muted)
-                    }
-
                     if store.isFetchingArtwork {
                         VStack(alignment: .leading, spacing: 6) {
                             ProgressView()
@@ -644,7 +629,7 @@ struct NowPlayingView: View {
             }
             .sheet(isPresented: $showQueue) { QueueView() }
             .sheet(isPresented: $showLyrics) {
-                if let song = player.currentSong { LyricsView(songID: song.id) }
+                LyricsView()
             }
             .sheet(isPresented: $showSleepTimer) { SleepTimerView() }
         }
@@ -687,25 +672,43 @@ struct LyricsView: View {
     @EnvironmentObject private var store: MusicStore
     @EnvironmentObject private var player: AudioPlayerService
     @Environment(\.dismiss) private var dismiss
-    let songID: UUID
     @State private var editing = false
     @State private var draft = ""
-    @State private var isLookingUp = false
-    @State private var debugLines: [String] = []
+    @State private var localLyrics: LocalLyrics?
+    @State private var isLoading = true
+    @State private var autoFollow = true
     @StateObject private var speech = LyricsSpeechManager()
 
+    private var songID: UUID? { player.currentSong?.id }
     private var song: Song? { store.song(songID) }
+    private var displayedLyrics: LocalLyrics? {
+        if let manual = song?.manualLyrics, let value = LocalLyrics.plain(manual) { return value }
+        return localLyrics
+    }
+    private var currentLineID: UUID? {
+        displayedLyrics?.syncedLines.last(where: { $0.time <= player.elapsed })?.id
+    }
 
     var body: some View {
         NavigationStack {
             Group {
                 if editing {
                     TextEditor(text: $draft).padding()
-                } else if let lyrics = song?.lyrics {
+                } else if isLoading {
+                    ProgressView("Loading lyrics...")
+                } else if let lyrics = displayedLyrics {
                     VStack(spacing: 12) {
-                        ScrollView { Text(lyrics).frame(maxWidth: .infinity, alignment: .leading).padding() }
+                        if lyrics.isSynced {
+                            syncedLyricsView(lyrics)
+                        } else {
+                            ScrollView {
+                                Text(lyrics.text)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding()
+                            }
+                        }
                         HStack {
-                            Button("Read") { speech.read(lyrics, pauseMusic: { player.pause() }) }
+                            Button("Read") { speech.read(lyrics.text, pauseMusic: { player.pause() }) }
                             Button("Pause") { speech.pause() }
                             Button("Resume") { speech.resume() }
                             Button("Stop") { speech.stop() }
@@ -715,18 +718,8 @@ struct LyricsView: View {
                 } else {
                     VStack(spacing: 14) {
                         ContentUnavailableView("No lyrics available", systemImage: "quote.bubble")
-                        Button("Find Lyrics Online") { findLyrics() }
-                            .buttonStyle(.borderedProminent).tint(.lime)
                         Button("Add Lyrics Manually") { draft = ""; editing = true }
                             .buttonStyle(.bordered)
-                        if isLookingUp { ProgressView("Searching...") }
-                        if !debugLines.isEmpty {
-                            DisclosureGroup("Lookup details") {
-                                ForEach(Array(debugLines.enumerated()), id: \.offset) { _, line in
-                                    Text(line).font(.caption.monospaced()).frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -735,39 +728,82 @@ struct LyricsView: View {
                 ToolbarItem(placement: .topBarLeading) { Button("Done") { dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(editing ? "Save" : "Edit") {
-                        if editing { store.updateLyrics(for: songID, manualLyrics: draft) }
+                        if editing, let songID { store.updateLyrics(for: songID, manualLyrics: draft) }
                         editing.toggle()
                     }
                 }
-                if song?.lyrics != nil && !editing {
+                if displayedLyrics != nil && !editing {
                     ToolbarItem(placement: .topBarTrailing) {
                         Menu {
-                            Button("Refresh Online Lyrics") { findLyrics(refresh: true) }
-                            Button("Clear Cached Lyrics") { store.clearCachedLyrics(for: songID) }
-                            if let lyrics = song?.lyrics {
-                                Button("Read Lyrics Aloud") { speech.read(lyrics, pauseMusic: { player.pause() }) }
+                            if let lyrics = displayedLyrics {
+                                Button("Read Lyrics Aloud") { speech.read(lyrics.text, pauseMusic: { player.pause() }) }
                             }
                             Button("Stop Reading") { speech.stop() }
                         } label: { Image(systemName: "ellipsis.circle") }
                     }
                 }
-                if editing, song?.manualLyrics != nil {
+                if editing, song?.manualLyrics != nil, let songID {
                     ToolbarItem(placement: .topBarTrailing) {
-                        Button("Clear Override") { store.updateLyrics(for: songID, manualLyrics: nil); draft = song?.embeddedLyrics ?? "" }
+                        Button("Clear Override") {
+                            store.updateLyrics(for: songID, manualLyrics: nil)
+                            draft = song?.embeddedLyrics ?? ""
+                        }
                     }
                 }
             }
-            .onAppear { draft = song?.lyrics ?? "" }
+            .task(id: songID) {
+                editing = false
+                autoFollow = true
+                isLoading = true
+                if let songID {
+                    localLyrics = await store.localLyrics(for: songID)
+                } else {
+                    localLyrics = nil
+                }
+                draft = song?.manualLyrics ?? localLyrics?.text ?? ""
+                isLoading = false
+            }
             .onDisappear { speech.stop() }
         }
     }
 
-    private func findLyrics(refresh: Bool = false) {
-        guard !isLookingUp else { return }
-        isLookingUp = true
-        Task { @MainActor in
-            debugLines = await store.findLyrics(for: songID, refresh: refresh)
-            isLookingUp = false
+    @ViewBuilder
+    private func syncedLyricsView(_ lyrics: LocalLyrics) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ForEach(lyrics.syncedLines) { line in
+                        Button {
+                            player.seek(to: line.time)
+                            autoFollow = true
+                        } label: {
+                            Text(line.text)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .font(line.id == currentLineID ? .title3.bold() : .body)
+                                .foregroundStyle(line.id == currentLineID ? Color.lime : .white.opacity(0.72))
+                                .padding(.horizontal)
+                        }
+                        .buttonStyle(.plain)
+                        .id(line.id)
+                    }
+                }
+                .padding(.vertical)
+            }
+            .simultaneousGesture(DragGesture().onChanged { _ in autoFollow = false })
+            .onChange(of: currentLineID) { _, newID in
+                guard autoFollow, let newID else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(newID, anchor: .center)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if !autoFollow {
+                    Button("Resume auto-scroll") { autoFollow = true }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.lime)
+                        .padding(.bottom, 8)
+                }
+            }
         }
     }
 }

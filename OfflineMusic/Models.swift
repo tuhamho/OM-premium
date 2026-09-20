@@ -130,6 +130,35 @@ struct Song: Identifiable, Codable, Hashable {
     }
 }
 
+struct SyncedLyricLine: Identifiable, Codable, Hashable {
+    let id: UUID
+    let time: TimeInterval
+    let text: String
+
+    init(id: UUID = UUID(), time: TimeInterval, text: String) {
+        self.id = id
+        self.time = time
+        self.text = text
+    }
+}
+
+struct LocalLyrics: Codable, Hashable {
+    let syncedLines: [SyncedLyricLine]
+    let plainText: String
+
+    var isSynced: Bool { !syncedLines.isEmpty }
+    var text: String {
+        if !plainText.isEmpty { return plainText }
+        return syncedLines.map(\.text).joined(separator: "\n")
+    }
+
+    static func plain(_ value: String) -> LocalLyrics? {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        return LocalLyrics(syncedLines: [], plainText: text)
+    }
+}
+
 struct Playlist: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
     var name: String

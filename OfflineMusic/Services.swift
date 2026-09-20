@@ -397,6 +397,11 @@ import UIKit
         objectWillChange.send()
     }
     func song(_ id: UUID?) -> Song? { songs.first { $0.id == id } }
+
+    func localLyrics(for id: UUID) async -> LocalLyrics? {
+        guard let song = songs.first(where: { $0.id == id }) else { return nil }
+        return await LocalLyricsResolver.shared.resolve(song: song, fileURL: documentURL(for: song.fileName))
+    }
     var artistGroups: [ArtistGroup] {
         let grouped = Dictionary(grouping: songs) { artistKey(for: $0.displayArtist) }
         return grouped.map { key, songs in
@@ -629,6 +634,146 @@ enum SleepTimerOption: String, CaseIterable, Identifiable {
 struct LyricsLookupResult {
     let lyrics: String?
     let logs: [String]
+}
+
+actor LocalLyricsResolver {
+    static let shared = LocalLyricsResolver()
+
+    private struct CacheRecord: Codable {
+        let sourcePath: String
+        let modificationDate: Date
+        let lyrics: LocalLyrics
+    }
+
+    private let fileManager = FileManager.default
+    private let cacheDirectory: URL
+
+    init() {
+        let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        cacheDirectory = support.appendingPathComponent("LyricsCache", isDirectory: true)
+        try? fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+    }
+
+    func resolve(song: Song, fileURL: URL) -> LocalLyrics? {
+        if let manual = nonEmpty(song.manualLyrics) {
+            return parse(manual)
+        }
+
+        let sidecar = sidecarURL(for: fileURL, extension: "lrc")
+        let plainSidecarLyrics = sidecar.flatMap { readCachedOrParse(songID: song.id, url: $0) }
+        if let plainSidecarLyrics, plainSidecarLyrics.isSynced {
+            return plainSidecarLyrics
+        }
+
+        if let embedded = nonEmpty(song.embeddedLyrics) {
+            return parse(embedded)
+        }
+
+        if let plainSidecarLyrics {
+            return plainSidecarLyrics
+        }
+
+        if let textSidecar = sidecarURL(for: fileURL, extension: "txt"),
+           let result = readCachedOrParse(songID: song.id, url: textSidecar) {
+            return result
+        }
+        return nil
+    }
+
+    private func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func sidecarURL(for audioURL: URL, extension fileExtension: String) -> URL? {
+        let base = audioURL.deletingPathExtension()
+        let exact = base.appendingPathExtension(fileExtension)
+        if fileManager.fileExists(atPath: exact.path) { return exact }
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: base.deletingLastPathComponent(),
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        let baseName = base.lastPathComponent
+        return entries.first { url in
+            url.pathExtension.caseInsensitiveCompare(fileExtension) == .orderedSame &&
+            url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(baseName) == .orderedSame
+        }
+    }
+
+    private func readCachedOrParse(songID: UUID, url: URL) -> LocalLyrics? {
+        guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+              let modificationDate = values.contentModificationDate else { return nil }
+        let cacheURL = cacheDirectory.appendingPathComponent("\(songID.uuidString).json")
+        if let data = try? Data(contentsOf: cacheURL),
+           let record = try? JSONDecoder().decode(CacheRecord.self, from: data),
+           record.sourcePath == url.path,
+           record.modificationDate == modificationDate {
+            return record.lyrics
+        }
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) else { return nil }
+        guard let lyrics = parse(text) else { return nil }
+        let record = CacheRecord(sourcePath: url.path, modificationDate: modificationDate, lyrics: lyrics)
+        if let encoded = try? JSONEncoder().encode(record) {
+            try? encoded.write(to: cacheURL, options: .atomic)
+        }
+        print("Local lyrics loaded: \(url.lastPathComponent), lines: \(lyrics.syncedLines.count), cache: \(cacheURL.path)")
+        return lyrics
+    }
+
+    private func parse(_ source: String) -> LocalLyrics? {
+        let pattern = #"\[(\d+):(?:(\d{1,2}):)?(\d{1,2})(?:[\.:](\d{1,3}))?\]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return LocalLyrics.plain(source) }
+        var lines: [SyncedLyricLine] = []
+        var plainLines: [String] = []
+
+        for rawLine in source.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            let range = NSRange(line.startIndex..<line.endIndex, in: line)
+            let matches = regex.matches(in: line, range: range)
+            if matches.isEmpty {
+                if !isMetadataTag(line) { plainLines.append(line) }
+                continue
+            }
+
+            let lyricText = regex.stringByReplacingMatches(in: line, options: [], range: range, withTemplate: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !lyricText.isEmpty else { continue }
+
+            for match in matches {
+                guard let timestamp = timestamp(from: match, in: line) else { continue }
+                lines.append(SyncedLyricLine(time: timestamp, text: lyricText))
+            }
+        }
+
+        if !lines.isEmpty {
+            let sorted = lines.sorted { $0.time == $1.time ? $0.id.uuidString < $1.id.uuidString : $0.time < $1.time }
+            return LocalLyrics(syncedLines: sorted, plainText: sorted.map(\.text).joined(separator: "\n"))
+        }
+        return LocalLyrics.plain(plainLines.joined(separator: "\n"))
+    }
+
+    private func timestamp(from match: NSTextCheckingResult, in line: String) -> TimeInterval? {
+        func component(_ index: Int) -> String? {
+            guard match.range(at: index).location != NSNotFound,
+                  let range = Range(match.range(at: index), in: line) else { return nil }
+            return String(line[range])
+        }
+        guard let first = Double(component(1) ?? ""), let last = Double(component(3) ?? "") else { return nil }
+        let hasHours = component(2) != nil
+        let hours = hasHours ? first : 0
+        let minutes = hasHours ? (Double(component(2) ?? "0") ?? 0) : first
+        let fractionText = component(4) ?? "0"
+        let fraction = (Double(fractionText) ?? 0) / pow(10, Double(fractionText.count))
+        return hours * 3600 + minutes * 60 + last + fraction
+    }
+
+    private func isMetadataTag(_ line: String) -> Bool {
+        line.range(of: #"^\[(ar|ti|al|by|offset|re|ve|length|tool|id):"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
 }
 
 actor LyricsLookupService {
