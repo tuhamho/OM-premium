@@ -27,6 +27,8 @@ struct Song: Identifiable, Codable, Hashable {
     var embeddedLyrics: String?
     var manualLyrics: String?
     var cachedOnlineLyrics: String?
+    var trackNumber: Int?
+    var discNumber: Int?
     var genre: String = ""
     var year: Int?
     var duration: Double = 0
@@ -37,7 +39,7 @@ struct Song: Identifiable, Codable, Hashable {
     var playCount: Int = 0
     var isFavorite: Bool = false
 
-    init(id: UUID = UUID(), title: String, artist: String, album: String, albumArtist: String = "", musicBrainzReleaseID: String? = nil, embeddedLyrics: String? = nil, manualLyrics: String? = nil, cachedOnlineLyrics: String? = nil, genre: String = "", year: Int? = nil, duration: Double = 0, fileName: String, artworkData: Data? = nil, importedAt: Date = .now, lastPlayed: Date? = nil, playCount: Int = 0, isFavorite: Bool = false) {
+    init(id: UUID = UUID(), title: String, artist: String, album: String, albumArtist: String = "", musicBrainzReleaseID: String? = nil, embeddedLyrics: String? = nil, manualLyrics: String? = nil, cachedOnlineLyrics: String? = nil, trackNumber: Int? = nil, discNumber: Int? = nil, genre: String = "", year: Int? = nil, duration: Double = 0, fileName: String, artworkData: Data? = nil, importedAt: Date = .now, lastPlayed: Date? = nil, playCount: Int = 0, isFavorite: Bool = false) {
         self.id = id
         self.title = title
         self.artist = artist
@@ -47,6 +49,8 @@ struct Song: Identifiable, Codable, Hashable {
         self.embeddedLyrics = embeddedLyrics
         self.manualLyrics = manualLyrics
         self.cachedOnlineLyrics = cachedOnlineLyrics
+        self.trackNumber = trackNumber
+        self.discNumber = discNumber
         self.genre = genre
         self.year = year
         self.duration = duration
@@ -59,7 +63,7 @@ struct Song: Identifiable, Codable, Hashable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, artist, album, albumArtist, musicBrainzReleaseID, embeddedLyrics, manualLyrics, cachedOnlineLyrics, genre, year, duration, fileName, artworkData, importedAt, lastPlayed, playCount, isFavorite
+        case id, title, artist, album, albumArtist, musicBrainzReleaseID, embeddedLyrics, manualLyrics, cachedOnlineLyrics, trackNumber, discNumber, genre, year, duration, fileName, artworkData, importedAt, lastPlayed, playCount, isFavorite
     }
 
     init(from decoder: Decoder) throws {
@@ -73,6 +77,8 @@ struct Song: Identifiable, Codable, Hashable {
         embeddedLyrics = try container.decodeIfPresent(String.self, forKey: .embeddedLyrics)
         manualLyrics = try container.decodeIfPresent(String.self, forKey: .manualLyrics)
         cachedOnlineLyrics = try container.decodeIfPresent(String.self, forKey: .cachedOnlineLyrics)
+        trackNumber = try container.decodeIfPresent(Int.self, forKey: .trackNumber)
+        discNumber = try container.decodeIfPresent(Int.self, forKey: .discNumber)
         genre = try container.decodeIfPresent(String.self, forKey: .genre) ?? ""
         year = try container.decodeIfPresent(Int.self, forKey: .year)
         duration = try container.decodeIfPresent(Double.self, forKey: .duration) ?? 0
@@ -95,6 +101,8 @@ struct Song: Identifiable, Codable, Hashable {
         try container.encodeIfPresent(embeddedLyrics, forKey: .embeddedLyrics)
         try container.encodeIfPresent(manualLyrics, forKey: .manualLyrics)
         try container.encodeIfPresent(cachedOnlineLyrics, forKey: .cachedOnlineLyrics)
+        try container.encodeIfPresent(trackNumber, forKey: .trackNumber)
+        try container.encodeIfPresent(discNumber, forKey: .discNumber)
         try container.encode(genre, forKey: .genre)
         try container.encodeIfPresent(year, forKey: .year)
         try container.encode(duration, forKey: .duration)

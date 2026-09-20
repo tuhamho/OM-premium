@@ -734,11 +734,39 @@ private struct PersistedState: Codable {
 }
 
 struct MetadataService {
+    private static func rawDescription(_ item: AVMetadataItem) -> String {
+        let identifier = item.identifier?.rawValue ?? "nil"
+        let key = item.key.map { String(describing: $0) } ?? "nil"
+        let keySpace = item.keySpace?.rawValue ?? "nil"
+        return "identifier=\(identifier) key=\(key) keySpace=\(keySpace)"
+    }
+
+    private static func matches(_ item: AVMetadataItem, _ terms: [String]) -> Bool {
+        let text = "\(item.identifier?.rawValue ?? "") \(item.key.map { String(describing: $0) } ?? "") \(item.keySpace?.rawValue ?? "")".lowercased()
+        return terms.contains { text.contains($0.lowercased()) }
+    }
+
+    private static func textValue(_ item: AVMetadataItem) -> String {
+        item.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private static func firstText(in items: [AVMetadataItem], commonIdentifier: AVMetadataIdentifier?, terms: [String]) -> String {
+        if let commonIdentifier,
+           let value = items.first(where: { $0.identifier == commonIdentifier }).map(textValue), !value.isEmpty {
+            return value
+        }
+        return items.first(where: { matches($0, terms) }).map(textValue) ?? ""
+    }
+
+    private static func number(_ value: String) -> Int? {
+        Int(value.split(separator: "/", maxSplits: 1).first ?? Substring(value))
+    }
+
     static func hasEmbeddedArtwork(asset: AVURLAsset) async -> Bool {
         guard let items = try? await asset.load(.metadata),
               let commonItems = try? await asset.load(.commonMetadata) else { return false }
         return (items + commonItems).contains {
-            $0.commonKey == .commonKeyArtwork || ($0.identifier?.rawValue.localizedCaseInsensitiveContains("artwork") == true)
+            $0.commonKey == .commonKeyArtwork || matches($0, ["artwork", "apic", "covr"])
         }
     }
 
@@ -748,34 +776,36 @@ struct MetadataService {
         let formatItems = try await asset.load(.metadata)
         let items = formatItems + commonItems
 
-        func value(_ identifier: AVMetadataIdentifier) -> String {
-            items.first(where: { $0.identifier == identifier })?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
-
-        func value(containing text: String) -> String {
-            items.first {
-                $0.identifier?.rawValue.localizedCaseInsensitiveContains(text) == true
-            }?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
-
         let reliableFallback = reliableFilenameCandidate(for: fileName)
         let fallbackTitle = reliableFallback?.title ?? cleanedFilename(for: fileName)
         let fallbackArtist = reliableFallback?.artist ?? "Unknown Artist"
-        let title = value(.commonIdentifierTitle).isEmpty ? fallbackTitle : value(.commonIdentifierTitle)
-        let artist = value(.commonIdentifierArtist).isEmpty ? fallbackArtist : value(.commonIdentifierArtist)
-        let album = value(.commonIdentifierAlbumName).isEmpty ? "Unknown Album" : value(.commonIdentifierAlbumName)
-        let albumArtist = value(containing: "albumartist").isEmpty ? artist : value(containing: "albumartist")
-        let lyrics = value(containing: "lyrics")
+        print("Metadata audit: \(fileName)")
+        for item in items {
+            print("  \(rawDescription(item)) value=\(textValue(item)) data=\(item.dataValue != nil ? "yes" : "no") type=\(String(describing: type(of: item.value)))")
+        }
+        let embeddedTitle = firstText(in: items, commonIdentifier: .commonIdentifierTitle, terms: ["tit2", "title"])
+        let embeddedArtist = firstText(in: items, commonIdentifier: .commonIdentifierArtist, terms: ["tpe1", "artist", "performer", "contributing"])
+        let embeddedAlbum = firstText(in: items, commonIdentifier: .commonIdentifierAlbumName, terms: ["talb", "album"])
+        let albumArtist = firstText(in: items, commonIdentifier: nil, terms: ["tpe2", "albumartist", "album artist"])
+        let genre = items.first(where: { matches($0, ["tcon", "genre"]) }).map(textValue) ?? ""
+        let trackNumber = items.first(where: { matches($0, ["trck", "tracknumber", "track number"]) }).flatMap { number(textValue($0)) }
+        let discNumber = items.first(where: { matches($0, ["tpos", "discnumber", "disc number"]) }).flatMap { number(textValue($0)) }
+        let yearText = items.first(where: { matches($0, ["tdrc", "tyer", "year", "date"]) }).map(textValue) ?? ""
+        let year = Int(String(yearText.prefix(4)))
+        let lyrics = items.first(where: { matches($0, ["uslt", "lyrics", "unsynchronized"]) }).map(textValue) ?? ""
         let artwork = items.first {
-            $0.commonKey == .commonKeyArtwork || ($0.identifier?.rawValue.localizedCaseInsensitiveContains("artwork") == true)
+            $0.commonKey == .commonKeyArtwork || matches($0, ["artwork", "apic", "covr"])
         }?.dataValue
 
         return Song(
-            title: title.isEmpty ? "Unknown Title" : title,
-            artist: artist.isEmpty ? "Unknown Artist" : artist,
-            album: album,
-            albumArtist: albumArtist,
+            title: embeddedTitle.isEmpty ? fallbackTitle : embeddedTitle,
+            artist: embeddedArtist.isEmpty ? fallbackArtist : embeddedArtist,
+            album: embeddedAlbum.isEmpty ? "Unknown Album" : embeddedAlbum,
+            albumArtist: albumArtist.isEmpty ? (embeddedArtist.isEmpty ? fallbackArtist : embeddedArtist) : albumArtist,
             embeddedLyrics: lyrics.isEmpty ? nil : lyrics,
+            trackNumber: trackNumber,
+            discNumber: discNumber,
+            genre: genre,
             duration: duration.isFinite ? duration : 0,
             fileName: fileName,
             artworkData: artwork
