@@ -292,6 +292,19 @@ enum PerformanceDiagnostics {
         objectWillChange.send()
     }
 
+    func reconcileExplicitDiscoverSong(_ id: UUID) {
+        guard let index = discoverSongIDs.firstIndex(of: id) else { return }
+        discoverSongIDs.remove(at: index)
+        recentDiscoverConsumedIDs.removeAll { $0 == id }
+        recentDiscoverConsumedIDs.append(id)
+        recentDiscoverConsumedIDs = Array(recentDiscoverConsumedIDs.suffix(40))
+        if let replacement = nextDiscoverReplacement(excluding: Set(discoverSongIDs).union([id])) {
+            discoverSongIDs.append(replacement.id)
+        }
+        scheduleSave()
+        objectWillChange.send()
+    }
+
     private func nextDiscoverReplacement(excluding excluded: Set<UUID>) -> Song? {
         let preferred = songs.filter { !excluded.contains($0.id) && !recentDiscoverConsumedIDs.contains($0.id) }
         let relaxed = songs.filter { !excluded.contains($0.id) }
@@ -2254,6 +2267,7 @@ private struct MusicBrainzRelease: Decodable {
     private var endNotificationAt: Date?
     private var preparedNextURL: URL?
     private var preparedNextSongID: UUID?
+    private var explicitPlaybackSongIDs: Set<UUID> = []
 
     func configure(with store: MusicStore) {
         self.store = store
@@ -2377,6 +2391,7 @@ private struct MusicBrainzRelease: Decodable {
         historyIndex = 0
         self.isDiscoverPlayback = isDiscoverPlayback
         manualQueueIDs.removeAll()
+        explicitPlaybackSongIDs.removeAll()
         queue = []
         preparedNextURL = nil
         preparedNextSongID = nil
@@ -2519,6 +2534,9 @@ private struct MusicBrainzRelease: Decodable {
         if isDiscoverPlayback, store?.discoverSongIDs.first == current.id {
             store?.consumeDiscoverSong(current.id)
         }
+        if isDiscoverPlayback, explicitPlaybackSongIDs.remove(current.id) != nil {
+            store?.reconcileExplicitDiscoverSong(current.id)
+        }
 
         let explicitNext = queue.first
         let randomNextID: UUID?
@@ -2546,6 +2564,7 @@ private struct MusicBrainzRelease: Decodable {
 #endif
             queue.removeFirst()
             manualQueueIDs.remove(next.id)
+            explicitPlaybackSongIDs.insert(next.id)
             load(next, recordHistory: true)
             print("END PERF advance called: \(Date()), end -> load: \(Date().timeIntervalSince(transitionStartedAt))s")
             return
