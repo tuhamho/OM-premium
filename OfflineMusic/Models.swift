@@ -17,6 +17,12 @@ enum SearchNormalization {
     }
 }
 
+struct SongFileFingerprint: Codable, Hashable, Sendable {
+    let relativePath: String
+    let fileSize: Int64
+    let modificationDate: Date
+}
+
 struct Song: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
     var title: String
@@ -28,6 +34,8 @@ struct Song: Identifiable, Codable, Hashable {
     var manualLyrics: String?
     var cachedOnlineLyrics: String?
     var importedLyricsFileName: String?
+    var lyricsOffset: Double = 0
+    var fileFingerprint: SongFileFingerprint?
     var trackNumber: Int?
     var discNumber: Int?
     var genre: String = ""
@@ -40,7 +48,7 @@ struct Song: Identifiable, Codable, Hashable {
     var playCount: Int = 0
     var isFavorite: Bool = false
 
-    init(id: UUID = UUID(), title: String, artist: String, album: String, albumArtist: String = "", musicBrainzReleaseID: String? = nil, embeddedLyrics: String? = nil, manualLyrics: String? = nil, cachedOnlineLyrics: String? = nil, importedLyricsFileName: String? = nil, trackNumber: Int? = nil, discNumber: Int? = nil, genre: String = "", year: Int? = nil, duration: Double = 0, fileName: String, artworkData: Data? = nil, importedAt: Date = .now, lastPlayed: Date? = nil, playCount: Int = 0, isFavorite: Bool = false) {
+    init(id: UUID = UUID(), title: String, artist: String, album: String, albumArtist: String = "", musicBrainzReleaseID: String? = nil, embeddedLyrics: String? = nil, manualLyrics: String? = nil, cachedOnlineLyrics: String? = nil, importedLyricsFileName: String? = nil, lyricsOffset: Double = 0, fileFingerprint: SongFileFingerprint? = nil, trackNumber: Int? = nil, discNumber: Int? = nil, genre: String = "", year: Int? = nil, duration: Double = 0, fileName: String, artworkData: Data? = nil, importedAt: Date = .now, lastPlayed: Date? = nil, playCount: Int = 0, isFavorite: Bool = false) {
         self.id = id
         self.title = title
         self.artist = artist
@@ -51,6 +59,8 @@ struct Song: Identifiable, Codable, Hashable {
         self.manualLyrics = manualLyrics
         self.cachedOnlineLyrics = cachedOnlineLyrics
         self.importedLyricsFileName = importedLyricsFileName
+        self.lyricsOffset = lyricsOffset
+        self.fileFingerprint = fileFingerprint
         self.trackNumber = trackNumber
         self.discNumber = discNumber
         self.genre = genre
@@ -65,7 +75,7 @@ struct Song: Identifiable, Codable, Hashable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, artist, album, albumArtist, musicBrainzReleaseID, embeddedLyrics, manualLyrics, cachedOnlineLyrics, importedLyricsFileName, trackNumber, discNumber, genre, year, duration, fileName, artworkData, importedAt, lastPlayed, playCount, isFavorite
+        case id, title, artist, album, albumArtist, musicBrainzReleaseID, embeddedLyrics, manualLyrics, cachedOnlineLyrics, importedLyricsFileName, lyricsOffset, fileFingerprint, trackNumber, discNumber, genre, year, duration, fileName, artworkData, importedAt, lastPlayed, playCount, isFavorite
     }
 
     init(from decoder: Decoder) throws {
@@ -80,6 +90,8 @@ struct Song: Identifiable, Codable, Hashable {
         manualLyrics = try container.decodeIfPresent(String.self, forKey: .manualLyrics)
         cachedOnlineLyrics = try container.decodeIfPresent(String.self, forKey: .cachedOnlineLyrics)
         importedLyricsFileName = try container.decodeIfPresent(String.self, forKey: .importedLyricsFileName)
+        lyricsOffset = try container.decodeIfPresent(Double.self, forKey: .lyricsOffset) ?? 0
+        fileFingerprint = try container.decodeIfPresent(SongFileFingerprint.self, forKey: .fileFingerprint)
         trackNumber = try container.decodeIfPresent(Int.self, forKey: .trackNumber)
         discNumber = try container.decodeIfPresent(Int.self, forKey: .discNumber)
         genre = try container.decodeIfPresent(String.self, forKey: .genre) ?? ""
@@ -105,6 +117,8 @@ struct Song: Identifiable, Codable, Hashable {
         try container.encodeIfPresent(manualLyrics, forKey: .manualLyrics)
         try container.encodeIfPresent(cachedOnlineLyrics, forKey: .cachedOnlineLyrics)
         try container.encodeIfPresent(importedLyricsFileName, forKey: .importedLyricsFileName)
+        try container.encode(lyricsOffset, forKey: .lyricsOffset)
+        try container.encodeIfPresent(fileFingerprint, forKey: .fileFingerprint)
         try container.encodeIfPresent(trackNumber, forKey: .trackNumber)
         try container.encodeIfPresent(discNumber, forKey: .discNumber)
         try container.encode(genre, forKey: .genre)
@@ -134,23 +148,79 @@ struct Song: Identifiable, Codable, Hashable {
     }
 }
 
+struct SyncedLyricWord: Identifiable, Codable, Hashable {
+    let id: UUID
+    let text: String
+    let startTime: TimeInterval
+    let endTime: TimeInterval?
+
+    init(id: UUID = UUID(), text: String, startTime: TimeInterval, endTime: TimeInterval? = nil) {
+        self.id = id
+        self.text = text
+        self.startTime = startTime
+        self.endTime = endTime
+    }
+}
+
 struct SyncedLyricLine: Identifiable, Codable, Hashable {
     let id: UUID
-    let time: TimeInterval
-    let text: String
+    let lineTime: TimeInterval
+    let words: [SyncedLyricWord]
+    let plainText: String
 
-    init(id: UUID = UUID(), time: TimeInterval, text: String) {
+    init(id: UUID = UUID(), lineTime: TimeInterval, words: [SyncedLyricWord] = [], plainText: String) {
         self.id = id
-        self.time = time
-        self.text = text
+        self.lineTime = lineTime
+        self.words = words
+        self.plainText = plainText
+    }
+
+    var time: TimeInterval { lineTime }
+    var text: String { plainText }
+    var hasWordTiming: Bool { !words.isEmpty }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, lineTime, time, words, plainText, text
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        if let value = try container.decodeIfPresent(TimeInterval.self, forKey: .lineTime) {
+            lineTime = value
+        } else {
+            lineTime = try container.decodeIfPresent(TimeInterval.self, forKey: .time) ?? 0
+        }
+        words = try container.decodeIfPresent([SyncedLyricWord].self, forKey: .words) ?? []
+        if let value = try container.decodeIfPresent(String.self, forKey: .plainText) {
+            plainText = value
+        } else {
+            plainText = try container.decodeIfPresent(String.self, forKey: .text) ?? words.map(\.text).joined()
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(lineTime, forKey: .lineTime)
+        try container.encode(words, forKey: .words)
+        try container.encode(plainText, forKey: .plainText)
     }
 }
 
 struct LocalLyrics: Codable, Hashable {
     let syncedLines: [SyncedLyricLine]
     let plainText: String
+    let fileProvidedOffset: TimeInterval
+
+    init(syncedLines: [SyncedLyricLine], plainText: String, fileProvidedOffset: TimeInterval = 0) {
+        self.syncedLines = syncedLines
+        self.plainText = plainText
+        self.fileProvidedOffset = fileProvidedOffset
+    }
 
     var isSynced: Bool { !syncedLines.isEmpty }
+    var isEnhanced: Bool { syncedLines.contains(where: \.hasWordTiming) }
     var text: String {
         if !plainText.isEmpty { return plainText }
         return syncedLines.map(\.text).joined(separator: "\n")
@@ -160,6 +230,24 @@ struct LocalLyrics: Codable, Hashable {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
         return LocalLyrics(syncedLines: [], plainText: text)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case syncedLines, plainText, fileProvidedOffset
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        syncedLines = try container.decodeIfPresent([SyncedLyricLine].self, forKey: .syncedLines) ?? []
+        plainText = try container.decodeIfPresent(String.self, forKey: .plainText) ?? ""
+        fileProvidedOffset = try container.decodeIfPresent(TimeInterval.self, forKey: .fileProvidedOffset) ?? 0
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(syncedLines, forKey: .syncedLines)
+        try container.encode(plainText, forKey: .plainText)
+        try container.encode(fileProvidedOffset, forKey: .fileProvidedOffset)
     }
 }
 

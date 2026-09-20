@@ -743,6 +743,7 @@ struct LyricsView: View {
     @State private var localLyrics: LocalLyrics?
     @State private var isLoading = true
     @State private var autoFollow = true
+    @State private var showingLyricsDebug = false
     @StateObject private var speech = LyricsSpeechManager()
 
     private var songID: UUID? { player.currentSong?.id }
@@ -754,8 +755,22 @@ struct LyricsView: View {
         if let manual = song?.manualLyrics, let value = LocalLyrics.plain(manual) { return value }
         return localLyrics
     }
+    private var fileOffset: Double { localLyrics?.fileProvidedOffset ?? 0 }
+    private var userOffset: Double { song?.lyricsOffset ?? 0 }
+    private var effectiveElapsed: Double { player.elapsed - fileOffset - userOffset }
     private var currentLineID: UUID? {
-        displayedLyrics?.syncedLines.last(where: { $0.time <= player.elapsed })?.id
+        displayedLyrics?.syncedLines.last(where: { $0.time <= effectiveElapsed })?.id
+    }
+    private var currentLine: SyncedLyricLine? {
+        displayedLyrics?.syncedLines.last(where: { $0.time <= effectiveElapsed })
+    }
+    private var currentWord: SyncedLyricWord? {
+        currentLine?.words.last(where: { $0.startTime <= effectiveElapsed })
+    }
+    private var debugText: String {
+        let line = currentLine.map { String(format: "%.2f", $0.lineTime) } ?? "none"
+        let word = currentWord?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? "none"
+        return "Lyrics type: \(localLyrics?.isEnhanced == true ? "Enhanced LRC" : "Plain LRC")\nAudio elapsed: \(String(format: "%.2f", player.elapsed))\nFile offset: \(signed(fileOffset))\nUser offset: \(signed(userOffset))\nEffective elapsed: \(String(format: "%.2f", effectiveElapsed))\nCurrent line timestamp: \(line)\nCurrent word: \(word)"
     }
 
     var body: some View {
@@ -769,6 +784,7 @@ struct LyricsView: View {
                     VStack(spacing: 12) {
                         if lyrics.isSynced {
                             syncedLyricsView(lyrics)
+                            timingControls(lyrics)
                         } else {
                             ScrollView {
                                 Text(lyrics.text)
@@ -812,6 +828,7 @@ struct LyricsView: View {
                                     store.removeImportedLyrics(for: songID)
                                 }
                             }
+                            Button("Lyrics Debug Info") { showingLyricsDebug = true }
                             Button("Stop Reading") { speech.stop() }
                         } label: { Image(systemName: "ellipsis.circle") }
                     }
@@ -838,7 +855,76 @@ struct LyricsView: View {
                 isLoading = false
             }
             .onDisappear { speech.stop() }
+            .alert("Lyrics Debug Info", isPresented: $showingLyricsDebug) {
+                Button("Done", role: .cancel) {}
+            } message: {
+                Text(debugText).font(.caption.monospaced())
+            }
         }
+    }
+
+    @ViewBuilder
+    private func timingControls(_ lyrics: LocalLyrics) -> some View {
+        VStack(spacing: 6) {
+            Text("Lyrics Timing").font(.caption.bold()).foregroundStyle(Color.muted)
+            HStack {
+                Button("-0.5s") { adjustOffset(by: -0.5) }
+                Spacer()
+                Text("Offset: \(signed(userOffset))")
+                    .font(.caption.monospaced())
+                Spacer()
+                Button("+0.5s") { adjustOffset(by: 0.5) }
+            }
+            .buttonStyle(.bordered)
+            HStack {
+                Button("-0.1s") { adjustOffset(by: -0.1) }
+                Button("Reset") { adjustOffset(to: 0) }
+                Button("+0.1s") { adjustOffset(by: 0.1) }
+            }
+            .buttonStyle(.bordered)
+            Text("File offset: \(signed(fileOffset))")
+                .font(.caption2.monospaced())
+                .foregroundStyle(Color.muted)
+            Text("Positive offset delays lyrics; effective time = audio − file offset − user offset")
+                .font(.caption2)
+                .foregroundStyle(Color.muted)
+                .multilineTextAlignment(.center)
+            if let lastTimestamp = lyrics.syncedLines.last?.lineTime {
+                Text("Audio: \(song?.durationText ?? "0:00") • Last lyric: \(String(format: "%.1fs", lastTimestamp))")
+                    .font(.caption2)
+                    .foregroundStyle(Color.muted)
+                if let duration = song?.duration, duration > 0, abs(duration - lastTimestamp) > 15 {
+                    Text("Lyrics timing may not match this audio version.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+            Button("Sync Current Line") { syncCurrentLine(lyrics) }
+                .buttonStyle(.borderedProminent)
+                .tint(.lime)
+                .disabled(currentLine == nil || songID == nil)
+        }
+        .padding(.horizontal)
+    }
+
+    private func adjustOffset(by value: Double) {
+        adjustOffset(to: userOffset + value)
+    }
+
+    private func adjustOffset(to value: Double) {
+        guard let songID else { return }
+        store.updateLyricsOffset(for: songID, value: value)
+    }
+
+    private func syncCurrentLine(_ lyrics: LocalLyrics) {
+        guard let songID, let line = currentLine else { return }
+        let requiredTotalOffset = player.elapsed - line.lineTime
+        let requiredUserOffset = requiredTotalOffset - lyrics.fileProvidedOffset
+        store.updateLyricsOffset(for: songID, value: requiredUserOffset)
+    }
+
+    private func signed(_ value: Double) -> String {
+        String(format: "%+.2fs", value)
     }
 
     @ViewBuilder
@@ -848,14 +934,25 @@ struct LyricsView: View {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     ForEach(lyrics.syncedLines) { line in
                         Button {
-                            player.seek(to: line.time)
+                            player.seek(to: line.time + fileOffset + userOffset)
                             autoFollow = true
                         } label: {
-                            Text(line.text)
+                            if line.hasWordTiming {
+                                HStack(spacing: 0) {
+                                    ForEach(line.words) { word in
+                                        KaraokeWordView(word: word, elapsed: effectiveElapsed)
+                                    }
+                                }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .font(line.id == currentLineID ? .title3.bold() : .body)
-                                .foregroundStyle(line.id == currentLineID ? Color.lime : .white.opacity(0.72))
                                 .padding(.horizontal)
+                            } else {
+                                Text(line.text)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .font(line.id == currentLineID ? .title3.bold() : .body)
+                                    .foregroundStyle(line.id == currentLineID ? Color.lime : .white.opacity(0.72))
+                                    .padding(.horizontal)
+                            }
                         }
                         .buttonStyle(.plain)
                         .id(line.id)
@@ -879,6 +976,32 @@ struct LyricsView: View {
                 }
             }
         }
+    }
+}
+
+struct KaraokeWordView: View {
+    let word: SyncedLyricWord
+    let elapsed: Double
+
+    private var progress: Double {
+        guard elapsed >= word.startTime else { return 0 }
+        guard let endTime = word.endTime, endTime > word.startTime else { return 1 }
+        return min(max((elapsed - word.startTime) / (endTime - word.startTime), 0), 1)
+    }
+
+    var body: some View {
+        Text(word.text)
+            .foregroundStyle(.white.opacity(0.30))
+            .overlay {
+                GeometryReader { proxy in
+                    Text(word.text)
+                        .foregroundStyle(Color.lime)
+                        .frame(width: proxy.size.width * progress, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .clipped()
+                }
+            }
+            .animation(.linear(duration: 0.08), value: progress)
     }
 }
 

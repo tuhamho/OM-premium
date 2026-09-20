@@ -15,7 +15,9 @@ struct OfflineMusicApp: App {
                     await store.load()
                     player.configure(with: store)
                     store.attach(player: player)
-                    await store.rescanDocuments()
+                    Task { @MainActor in
+                        await store.reconcileDocumentsInBackground()
+                    }
                 }
         }
     }

@@ -79,10 +79,24 @@ import UIKit
         return url.path.hasPrefix(prefix) ? String(url.path.dropFirst(prefix.count)) : url.lastPathComponent
     }
 
+    private func fingerprint(for url: URL, relativePath: String) -> SongFileFingerprint? {
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let fileSize = values.fileSize,
+              let modificationDate = values.contentModificationDate else { return nil }
+        return SongFileFingerprint(relativePath: relativePath, fileSize: Int64(fileSize), modificationDate: modificationDate)
+    }
+
     func load() async {
         guard let data = try? Data(contentsOf: stateURL), let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
         songs = state.songs; playlists = state.playlists; recentlyPlayed = state.recentlyPlayed; currentSongID = state.currentSongID; savedPosition = state.savedPosition
-        let needsArtworkMigration = state.artworkMatchingVersion != ArtworkMatchingConfiguration.version
+        let artworkVersion = state.artworkMatchingVersion
+        Task { @MainActor [weak self] in
+            await self?.restoreArtworkAfterLaunch(version: artworkVersion)
+        }
+    }
+
+    private func restoreArtworkAfterLaunch(version: Int?) async {
+        let needsArtworkMigration = version != ArtworkMatchingConfiguration.version
         if needsArtworkMigration {
             for index in songs.indices where songs[index].artworkData != nil {
                 let url = documentURL(for: songs[index].fileName)
@@ -96,8 +110,11 @@ import UIKit
             save()
         }
         for index in songs.indices where songs[index].artworkData == nil {
-            songs[index].artworkData = await ArtworkCache.shared.data(for: songs[index].id.uuidString)
+            if let artwork = await ArtworkCache.shared.data(for: songs[index].id.uuidString) {
+                songs[index].artworkData = artwork
+            }
         }
+        objectWillChange.send()
     }
 
     func save() {
@@ -128,6 +145,7 @@ import UIKit
                 var metadata = try await MetadataService.read(asset: asset, fileName: name)
                 metadata.artworkData = ArtworkCache.resizedArtwork(metadata.artworkData)
                 metadata.fileName = relativeDocumentPath(for: destination)
+                metadata.fileFingerprint = fingerprint(for: destination, relativePath: metadata.fileName)
                 songs.append(metadata)
                 if let artwork = metadata.artworkData { await ArtworkCache.shared.store(artwork, for: metadata.id.uuidString) }
                 imported += 1
@@ -135,6 +153,85 @@ import UIKit
         }
         save()
         return imported
+    }
+
+    func reconcileDocumentsInBackground() async {
+        guard !isScanning else { return }
+        if songs.isEmpty {
+            await rescanDocuments()
+            return
+        }
+
+        let startedAt = Date()
+        let documentsURL = documentsDirectory
+        let audioFiles = await Task.detached(priority: .utility) {
+            Self.enumerateAudioFiles(in: documentsURL)
+        }.value
+        let currentPaths = Set(audioFiles.map { relativeDocumentPath(for: $0) })
+        let knownPaths = Set(songs.map(\.fileName))
+        let removedIDs = songs.compactMap { song in
+            currentPaths.contains(song.fileName) || fm.fileExists(atPath: documentURL(for: song.fileName).path) ? nil : song.id
+        }
+        if !removedIDs.isEmpty {
+            removeSongs(removedIDs)
+        }
+
+        var unchanged = 0
+        var added = 0
+        var modified = 0
+        var metadataRereads = 0
+
+        for url in audioFiles {
+            let relativePath = relativeDocumentPath(for: url)
+            guard let currentFingerprint = fingerprint(for: url, relativePath: relativePath) else { continue }
+            let index = songs.firstIndex(where: {
+                $0.fileName == relativePath || (!knownPaths.contains(relativePath) && $0.fileName == url.lastPathComponent)
+            })
+
+            if let index, songs[index].fileFingerprint == currentFingerprint {
+                unchanged += 1
+                continue
+            }
+
+            do {
+                var metadata = try await MetadataService.read(asset: AVURLAsset(url: url), fileName: url.lastPathComponent)
+                metadata.fileName = relativePath
+                metadata.fileFingerprint = currentFingerprint
+                metadata.artworkData = ArtworkCache.resizedArtwork(metadata.artworkData)
+                metadataRereads += 1
+
+                if let index {
+                    let existing = songs[index]
+                    metadata.id = existing.id
+                    metadata.importedAt = existing.importedAt
+                    metadata.lastPlayed = existing.lastPlayed
+                    metadata.playCount = existing.playCount
+                    metadata.isFavorite = existing.isFavorite
+                    metadata.musicBrainzReleaseID = existing.musicBrainzReleaseID
+                    metadata.manualLyrics = existing.manualLyrics
+                    metadata.cachedOnlineLyrics = existing.cachedOnlineLyrics
+                    metadata.importedLyricsFileName = existing.importedLyricsFileName
+                    metadata.lyricsOffset = existing.lyricsOffset
+                    if metadata.artworkData == nil { metadata.artworkData = existing.artworkData }
+                    songs[index] = metadata
+                    if player?.currentSong?.id == metadata.id { player?.syncCurrentSong(metadata) }
+                    modified += 1
+                } else {
+                    songs.append(metadata)
+                    added += 1
+                }
+            } catch {
+                print("Background metadata failed for \(url.lastPathComponent):", error)
+            }
+        }
+
+        if !removedIDs.isEmpty || added > 0 || modified > 0 {
+            save()
+            objectWillChange.send()
+        }
+        let duration = Date().timeIntervalSince(startedAt)
+        let durationText = String(format: "%.2fs", duration)
+        print("Startup library: Persisted songs: \(knownPaths.count), Filesystem audio files: \(audioFiles.count), Unchanged: \(unchanged), Added: \(added), Modified: \(modified), Removed: \(removedIDs.count), Metadata rereads: \(metadataRereads), Startup sync duration: \(durationText)")
     }
 
     func rescanDocuments() async {
@@ -159,13 +256,7 @@ import UIKit
         let missingIDs = songs.compactMap { song in
             foundPaths.contains(song.fileName) || fm.fileExists(atPath: documentURL(for: song.fileName).path) ? nil : song.id
         }
-        if !missingIDs.isEmpty {
-            songs.removeAll { missingIDs.contains($0.id) }
-            recentlyPlayed.removeAll { missingIDs.contains($0) }
-            playlists.indices.forEach { index in
-                playlists[index].songIDs.removeAll { missingIDs.contains($0) }
-            }
-        }
+        if !missingIDs.isEmpty { removeSongs(missingIDs) }
 
         let knownPaths = Set(songs.map(\.fileName))
         var importedCount = 0
@@ -180,6 +271,7 @@ import UIKit
                 )
                 metadata.artworkData = ArtworkCache.resizedArtwork(metadata.artworkData)
                 metadata.fileName = relativePath
+                metadata.fileFingerprint = fingerprint(for: url, relativePath: relativePath)
                 if let index = songs.firstIndex(where: { $0.fileName == relativePath || (!knownPaths.contains(relativePath) && $0.fileName == url.lastPathComponent) }) {
                     let existing = songs[index]
                     metadata.id = existing.id
@@ -191,6 +283,7 @@ import UIKit
                     metadata.manualLyrics = existing.manualLyrics
                     metadata.cachedOnlineLyrics = existing.cachedOnlineLyrics
                     metadata.importedLyricsFileName = existing.importedLyricsFileName
+                    metadata.lyricsOffset = existing.lyricsOffset
                     if metadata.artworkData == nil { metadata.artworkData = existing.artworkData }
                     songs[index] = metadata
                 } else {
@@ -209,6 +302,20 @@ import UIKit
         isScanning = false
         scanMessage = "Scan complete — \(songs.count) songs found"
         print("Library songs:", songs.count, "(imported:", importedCount, ")")
+    }
+
+    private func removeSongs(_ ids: [UUID]) {
+        let removed = Set(ids)
+        songs.removeAll { removed.contains($0.id) }
+        recentlyPlayed.removeAll { removed.contains($0) }
+        playlists.indices.forEach { index in
+            playlists[index].songIDs.removeAll { removed.contains($0) }
+        }
+        if let player {
+            player.queue.removeAll { removed.contains($0.id) }
+            if let currentID = player.currentSong?.id, removed.contains(currentID) { player.pause() }
+        }
+        if currentSongID.map(removed.contains) == true { currentSongID = nil }
     }
 
     func identifyAndFetchArtwork(for id: UUID) async {
@@ -373,6 +480,7 @@ import UIKit
             local.playCount = existing.playCount
             local.isFavorite = existing.isFavorite
             local.importedLyricsFileName = existing.importedLyricsFileName
+            local.lyricsOffset = existing.lyricsOffset
             songs[index] = local
         }
         save()
@@ -619,6 +727,14 @@ import UIKit
         player?.syncCurrentSong(songs[index])
     }
 
+    func updateLyricsOffset(for id: UUID, value: Double) {
+        guard let index = songs.firstIndex(where: { $0.id == id }) else { return }
+        songs[index].lyricsOffset = min(max(value, -15), 15)
+        save()
+        lyricsRevision = UUID()
+        objectWillChange.send()
+    }
+
     func findLyrics(for id: UUID, refresh: Bool = false) async -> [String] {
         guard let index = songs.firstIndex(where: { $0.id == id }) else { return ["Song not found"] }
         let song = songs[index]
@@ -861,36 +977,73 @@ actor LocalLyricsResolver {
     }
 
     private func parse(_ source: String) -> LocalLyrics? {
-        let pattern = #"\[(\d+):(?:(\d{1,2}):)?(\d{1,2})(?:[\.:](\d{1,3}))?\]"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return LocalLyrics.plain(source) }
-        var lines: [SyncedLyricLine] = []
+        let timestampPattern = #"(\d+):(?:(\d{1,2}):)?(\d{1,2})(?:[\.:](\d{1,3}))?"#
+        guard let lineRegex = try? NSRegularExpression(pattern: "\\[\(timestampPattern)\\]"),
+              let wordRegex = try? NSRegularExpression(pattern: "<\(timestampPattern)>"),
+              let offsetRegex = try? NSRegularExpression(pattern: #"^\[offset:([+-]?\d+)\]$"#, options: .caseInsensitive) else {
+            return LocalLyrics.plain(source)
+        }
+        var parsedLines: [(lineTime: TimeInterval, words: [SyncedLyricWord], text: String)] = []
         var plainLines: [String] = []
+        var fileOffset: TimeInterval = 0
 
         for rawLine in source.components(separatedBy: .newlines) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !line.isEmpty else { continue }
             let range = NSRange(line.startIndex..<line.endIndex, in: line)
-            let matches = regex.matches(in: line, range: range)
+            if let offsetMatch = offsetRegex.firstMatch(in: line, range: range),
+               let valueRange = Range(offsetMatch.range(at: 1), in: line),
+               let milliseconds = Double(line[valueRange]) {
+                fileOffset = milliseconds / 1000
+                continue
+            }
+
+            let matches = lineRegex.matches(in: line, range: range)
             if matches.isEmpty {
                 if !isMetadataTag(line) { plainLines.append(line) }
                 continue
             }
 
-            let lyricText = regex.stringByReplacingMatches(in: line, options: [], range: range, withTemplate: "")
+            let lyricText = lineRegex.stringByReplacingMatches(in: line, options: [], range: range, withTemplate: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !lyricText.isEmpty else { continue }
 
             for match in matches {
-                guard let timestamp = timestamp(from: match, in: line) else { continue }
-                lines.append(SyncedLyricLine(time: timestamp, text: lyricText))
+                guard let lineTime = timestamp(from: match, in: line) else { continue }
+                let wordMatches = wordRegex.matches(in: lyricText, range: NSRange(lyricText.startIndex..<lyricText.endIndex, in: lyricText))
+                var words: [SyncedLyricWord] = []
+                for (index, wordMatch) in wordMatches.enumerated() {
+                    guard let startTime = timestamp(from: wordMatch, in: lyricText),
+                          let tagRange = Range(wordMatch.range, in: lyricText) else { continue }
+                    let contentStart = tagRange.upperBound
+                    let contentEnd: String.Index
+                    if index + 1 < wordMatches.count, let nextRange = Range(wordMatches[index + 1].range, in: lyricText) {
+                        contentEnd = nextRange.lowerBound
+                    } else {
+                        contentEnd = lyricText.endIndex
+                    }
+                    let wordText = String(lyricText[contentStart..<contentEnd])
+                    guard !wordText.isEmpty else { continue }
+                    words.append(SyncedLyricWord(text: wordText, startTime: startTime))
+                }
+                parsedLines.append((lineTime: lineTime, words: words, text: lyricText.replacingOccurrences(of: #"<\d+:.+?>"#, with: "", options: .regularExpression)))
             }
         }
 
-        if !lines.isEmpty {
-            let sorted = lines.sorted { $0.time == $1.time ? $0.id.uuidString < $1.id.uuidString : $0.time < $1.time }
-            return LocalLyrics(syncedLines: sorted, plainText: sorted.map(\.text).joined(separator: "\n"))
+        if !parsedLines.isEmpty {
+            let sorted = parsedLines.sorted { $0.lineTime < $1.lineTime }
+            let lines = sorted.enumerated().map { index, item in
+                let nextLineTime = index + 1 < sorted.count ? sorted[index + 1].lineTime : nil
+                let completedWords = item.words.enumerated().map { wordIndex, word in
+                    let nextWordTime = wordIndex + 1 < item.words.count ? item.words[wordIndex + 1].startTime : nextLineTime
+                    return SyncedLyricWord(id: word.id, text: word.text, startTime: word.startTime, endTime: nextWordTime)
+                }
+                return SyncedLyricLine(lineTime: item.lineTime, words: completedWords, plainText: item.text)
+            }
+            return LocalLyrics(syncedLines: lines, plainText: lines.map(\.text).joined(separator: "\n"), fileProvidedOffset: fileOffset)
         }
-        return LocalLyrics.plain(plainLines.joined(separator: "\n"))
+        guard let plain = LocalLyrics.plain(plainLines.joined(separator: "\n")) else { return nil }
+        return LocalLyrics(syncedLines: plain.syncedLines, plainText: plain.text, fileProvidedOffset: fileOffset)
     }
 
     private func timestamp(from match: NSTextCheckingResult, in line: String) -> TimeInterval? {
