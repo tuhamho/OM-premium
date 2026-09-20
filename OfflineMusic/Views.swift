@@ -56,7 +56,14 @@ private struct RootPlayerBar: View {
     }
 
     private func tabButton(_ icon: String, _ text: String, _ value: Int) -> some View {
-        Button { tab = value } label: {
+        Button {
+            let previous = tab
+            let started = DispatchTime.now().uptimeNanoseconds
+            tab = value
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            let elapsedText = String(format: "%.1f", elapsed)
+            print("TAB PERF \(previous) -> \(value): \(elapsedText)ms")
+        } label: {
             VStack(spacing: 4) {
                 Image(systemName: icon).font(.system(size: 19, weight: .semibold))
                 Text(text).font(.caption2)
@@ -76,10 +83,6 @@ struct HomeView: View {
         return hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening"
     }
 
-    private var uniqueAlbums: [Song] {
-        Dictionary(grouping: store.songs, by: { $0.displayAlbum }).compactMap { $0.value.first }
-    }
-
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -91,10 +94,10 @@ struct HomeView: View {
                     if store.songs.isEmpty {
                         EmptyState(title: "Your music, your way", message: "Import local audio files to start building your library.", icon: "waveform")
                     } else {
-                        section("Recently Played", songs: store.recentlyPlayed.compactMap(store.song))
-                        section("Recently Added", songs: Array(store.songs.sorted { $0.importedAt > $1.importedAt }.prefix(10)))
-                        section("Albums", songs: uniqueAlbums)
-                        section("Favorites", songs: store.songs.filter(\.isFavorite))
+                        section("Recently Played", songs: store.homeRecentlyPlayedSongs)
+                        section("Recently Added", songs: store.homeRecentlyAddedSongs)
+                        section("Albums", songs: store.homeAlbumSongs)
+                        section("Favorites", songs: store.homeFavoriteSongs)
                     }
                 }
                 .padding(.horizontal, 20)
@@ -105,6 +108,10 @@ struct HomeView: View {
                     Image(systemName: "bell").foregroundStyle(.white)
                 }
             }
+            .onAppear {
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - PerformanceDiagnostics.launchStartedAt) / 1_000_000
+                print(String(format: "HOME PERF open: %.1fms", elapsed))
+            }
         }
     }
 
@@ -113,14 +120,17 @@ struct HomeView: View {
         if !songs.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
                 Text(title).font(.title3.bold())
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 14) {
-                        ForEach(songs) { song in
-                            SongCard(song: song) {
-                                store.play(song, from: songs)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 14) {
+                                ForEach(songs) { song in
+                                    SongCard(song: song) {
+                                        let started = DispatchTime.now().uptimeNanoseconds
+                                        store.play(song, from: songs)
+                                        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                                        print(String(format: "HOME PERF song tap: %.1fms", elapsed))
+                                    }
+                                }
                             }
-                        }
-                    }
                 }
             }
         }
@@ -229,7 +239,12 @@ struct LibraryView: View {
                             }
                         default:
                             ForEach(filtered) { song in
-                                SongRow(song: song) { store.play(song, from: filtered) }
+                                SongRow(song: song) {
+                                    let started = DispatchTime.now().uptimeNanoseconds
+                                    store.play(song, from: filtered)
+                                    let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                                    print(String(format: "LIBRARY PERF song tap: %.1fms", elapsed))
+                                }
                                     .swipeActions {
                                         Button(role: .destructive) { store.delete(song) } label: {
                                             Label("Delete", systemImage: "trash")
@@ -1281,13 +1296,27 @@ struct DebugStatusView: View {
     }
 }
 
+private final class ArtworkImageCache {
+    static let shared = ArtworkImageCache()
+    private let cache = NSCache<NSString, UIImage>()
+
+    func image(for key: String) -> UIImage? {
+        cache.object(forKey: key as NSString)
+    }
+
+    func insert(_ image: UIImage, for key: String) {
+        cache.setObject(image, forKey: key as NSString)
+    }
+}
+
 struct ArtworkView: View {
     let song: Song?
     let size: CGFloat
+    @State private var decodedImage: UIImage?
 
     var body: some View {
         Group {
-            if let data = song?.artworkData, let image = UIImage(data: data) {
+            if let image = decodedImage {
                 Image(uiImage: image).resizable().scaledToFill()
             } else {
                 LinearGradient(colors: placeholderColors, startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -1296,6 +1325,24 @@ struct ArtworkView: View {
         }
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: size > 100 ? 16 : 8))
+        .task(id: artworkKey) {
+            decodedImage = nil
+            guard let data = song?.artworkData else { return }
+            let key = artworkKey
+            if let cached = ArtworkImageCache.shared.image(for: key) {
+                decodedImage = cached
+                return
+            }
+            await Task.yield()
+            guard !Task.isCancelled, let image = UIImage(data: data) else { return }
+            ArtworkImageCache.shared.insert(image, for: key)
+            decodedImage = image
+        }
+    }
+
+    private var artworkKey: String {
+        guard let song else { return "none" }
+        return "\(song.id.uuidString)-\(song.artworkData?.count ?? 0)"
     }
 
     private var placeholderColors: [Color] {

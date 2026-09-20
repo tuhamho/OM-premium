@@ -48,6 +48,12 @@ enum PerformanceDiagnostics {
     private weak var player: AudioPlayerService?
     private var enrichmentRunID = UUID()
     private var saveTask: Task<Void, Never>?
+    private var libraryRevision = 0
+    private var homeCacheRevision = -1
+    private var cachedHomeRecentlyPlayed: [Song] = []
+    private var cachedHomeRecentlyAdded: [Song] = []
+    private var cachedHomeAlbums: [Song] = []
+    private var cachedHomeFavorites: [Song] = []
     let sleepTimer = SleepTimerManager()
 
     init() {
@@ -98,6 +104,7 @@ enum PerformanceDiagnostics {
         guard let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
         let decodeDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead
         songs = state.songs; playlists = state.playlists; recentlyPlayed = state.recentlyPlayed; currentSongID = state.currentSongID; savedPosition = state.savedPosition
+        invalidateHomeCache()
         let publishDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead - decodeDuration
         print(String(format: "STARTUP PERF persisted load: %.1fms, decode: %.1fms, publish songs: %.1fms, songs: %d", persistedRead, decodeDuration, publishDuration, songs.count))
         let artworkVersion = state.artworkMatchingVersion
@@ -149,6 +156,24 @@ enum PerformanceDiagnostics {
         self.player = player
     }
 
+    private func invalidateHomeCache() {
+        libraryRevision &+= 1
+    }
+
+    private func rebuildHomeCacheIfNeeded() {
+        guard homeCacheRevision != libraryRevision else { return }
+        cachedHomeRecentlyPlayed = recentlyPlayed.compactMap(song)
+        cachedHomeRecentlyAdded = Array(songs.sorted { $0.importedAt > $1.importedAt }.prefix(10))
+        cachedHomeAlbums = Dictionary(grouping: songs, by: { $0.displayAlbum }).compactMap { $0.value.first }
+        cachedHomeFavorites = songs.filter(\.isFavorite)
+        homeCacheRevision = libraryRevision
+    }
+
+    var homeRecentlyPlayedSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeRecentlyPlayed }
+    var homeRecentlyAddedSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeRecentlyAdded }
+    var homeAlbumSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeAlbums }
+    var homeFavoriteSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeFavorites }
+
     func play(_ song: Song, from list: [Song]? = nil) {
         player?.play(song, from: list)
     }
@@ -186,6 +211,7 @@ enum PerformanceDiagnostics {
                 imported += 1
             } catch { continue }
         }
+        if imported > 0 { invalidateHomeCache() }
         save()
         return imported
     }
@@ -263,6 +289,7 @@ enum PerformanceDiagnostics {
         }
 
         if !removedIDs.isEmpty || added > 0 || modified > 0 {
+            invalidateHomeCache()
             save()
             objectWillChange.send()
         }
@@ -337,6 +364,7 @@ enum PerformanceDiagnostics {
         }
 
         save()
+        invalidateHomeCache()
         isScanning = false
         scanMessage = "Scan complete — \(songs.count) songs found"
         print("Library songs:", songs.count, "(imported:", importedCount, ")")
@@ -354,6 +382,7 @@ enum PerformanceDiagnostics {
             if let currentID = player.currentSong?.id, removed.contains(currentID) { player.pause() }
         }
         if currentSongID.map(removed.contains) == true { currentSongID = nil }
+        invalidateHomeCache()
     }
 
     func identifyAndFetchArtwork(for id: UUID) async {
@@ -496,6 +525,7 @@ enum PerformanceDiagnostics {
         }
 
         songs[index] = updated
+        invalidateHomeCache()
         objectWillChange.send()
         save()
         player?.syncCurrentSong(updated)
@@ -521,6 +551,7 @@ enum PerformanceDiagnostics {
             local.lyricsOffset = existing.lyricsOffset
             songs[index] = local
         }
+        invalidateHomeCache()
         save()
         objectWillChange.send()
     }
@@ -556,6 +587,7 @@ enum PerformanceDiagnostics {
     func update(_ id: UUID, _ change: (inout Song) -> Void) {
         guard let i = songs.firstIndex(where: { $0.id == id }) else { return }
         change(&songs[i])
+        invalidateHomeCache()
         objectWillChange.send()
     }
     func song(_ id: UUID?) -> Song? { songs.first { $0.id == id } }
@@ -748,7 +780,7 @@ enum PerformanceDiagnostics {
         }
     }
     func markPlayed(_ id: UUID) { update(id) { $0.playCount += 1; $0.lastPlayed = .now }; recentlyPlayed.removeAll { $0 == id }; recentlyPlayed.insert(id, at: 0); recentlyPlayed = Array(recentlyPlayed.prefix(30)); currentSongID = id; scheduleSave() }
-    func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; save() }
+    func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; invalidateHomeCache(); save() }
     func addPlaylist(name: String) { playlists.append(Playlist(name: name)); save() }
     func addSong(_ songID: UUID, to playlistID: UUID) {
         guard let index = playlists.firstIndex(where: { $0.id == playlistID }),
@@ -766,6 +798,7 @@ enum PerformanceDiagnostics {
         songs[index].artist = artist.trimmingCharacters(in: .whitespacesAndNewlines)
         songs[index].album = album.trimmingCharacters(in: .whitespacesAndNewlines)
         songs[index].albumArtist = albumArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+        invalidateHomeCache()
         save()
         objectWillChange.send()
         player?.syncCurrentSong(songs[index])
