@@ -26,6 +26,11 @@ import UIKit
     @Published var artworkFetchSummary = ""
     @Published var enrichmentCurrentSong = ""
     @Published var enrichmentStatus = ""
+    @Published var isFetchingLyrics = false
+    @Published var lyricsFetchProgress = 0
+    @Published var lyricsFetchTotal = 0
+    @Published var lyricsFetchCurrent = ""
+    @Published var lyricsFetchSummary = ""
 
     private let stateURL: URL
     private let fm = FileManager.default
@@ -169,6 +174,8 @@ import UIKit
                     metadata.playCount = existing.playCount
                     metadata.isFavorite = existing.isFavorite
                     metadata.musicBrainzReleaseID = existing.musicBrainzReleaseID
+                    metadata.manualLyrics = existing.manualLyrics
+                    metadata.cachedOnlineLyrics = existing.cachedOnlineLyrics
                     if metadata.artworkData == nil { metadata.artworkData = existing.artworkData }
                     songs[index] = metadata
                 } else {
@@ -487,6 +494,72 @@ import UIKit
         objectWillChange.send()
         player?.syncCurrentSong(songs[index])
     }
+
+    func findLyrics(for id: UUID, refresh: Bool = false) async -> [String] {
+        guard let index = songs.firstIndex(where: { $0.id == id }) else { return ["Song not found"] }
+        let song = songs[index]
+        guard song.manualLyrics?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
+            return ["Manual lyrics override is active"]
+        }
+        if !refresh, let cached = song.cachedOnlineLyrics, !cached.isEmpty {
+            return ["Cached lyrics used", "Lyrics characters: \(cached.count)"]
+        }
+        let result = await LyricsLookupService.shared.lookup(for: song)
+        if let lyrics = result.lyrics {
+            songs[index].cachedOnlineLyrics = lyrics
+            save()
+            objectWillChange.send()
+        }
+        return result.logs
+    }
+
+    func clearCachedLyrics(for id: UUID) {
+        guard let index = songs.firstIndex(where: { $0.id == id }) else { return }
+        songs[index].cachedOnlineLyrics = nil
+        save()
+        objectWillChange.send()
+    }
+
+    func startMissingLyricsFetch() {
+        guard !isFetchingLyrics else { return }
+        let ids = songs.filter { $0.manualLyrics?.isEmpty != false && $0.embeddedLyrics?.isEmpty != false && $0.cachedOnlineLyrics?.isEmpty != false }.map(\.id)
+        isFetchingLyrics = true
+        lyricsFetchProgress = 0
+        lyricsFetchTotal = ids.count
+        lyricsFetchSummary = ""
+        Task { @MainActor [weak self] in await self?.runMissingLyricsFetch(ids: ids) }
+    }
+
+    func cancelMissingLyricsFetch() {
+        isFetchingLyrics = false
+        lyricsFetchSummary = "Lyrics fetch cancelled"
+    }
+
+    private func runMissingLyricsFetch(ids: [UUID]) async {
+        var found = 0
+        var notFound = 0
+        var failed = 0
+        for id in ids {
+            guard isFetchingLyrics, let index = songs.firstIndex(where: { $0.id == id }) else { break }
+            lyricsFetchProgress += 1
+            lyricsFetchCurrent = "\(songs[index].displayArtist) - \(songs[index].title)"
+            let result = await LyricsLookupService.shared.lookup(for: songs[index])
+            guard isFetchingLyrics else { break }
+            if let lyrics = result.lyrics {
+                songs[index].cachedOnlineLyrics = lyrics
+                found += 1
+                save()
+                objectWillChange.send()
+            } else if result.logs.contains(where: { $0.localizedCaseInsensitiveContains("error") }) {
+                failed += 1
+            } else {
+                notFound += 1
+            }
+        }
+        let cancelled = !isFetchingLyrics
+        isFetchingLyrics = false
+        lyricsFetchSummary = cancelled ? "Lyrics fetch cancelled" : "Found: \(found) • Not found: \(notFound) • Failed: \(failed)"
+    }
 }
 
 enum SleepTimerOption: String, CaseIterable, Identifiable {
@@ -551,6 +624,104 @@ enum SleepTimerOption: String, CaseIterable, Identifiable {
         guard let remaining else { return nil }
         return String(format: "%02d:%02d", Int(remaining) / 60, Int(remaining) % 60)
     }
+}
+
+struct LyricsLookupResult {
+    let lyrics: String?
+    let logs: [String]
+}
+
+actor LyricsLookupService {
+    static let shared = LyricsLookupService()
+
+    func lookup(for song: Song) async -> LyricsLookupResult {
+        let artist = song.artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = song.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !artist.isEmpty, artist.caseInsensitiveCompare("Unknown Artist") != .orderedSame,
+              !title.isEmpty, title.caseInsensitiveCompare("Unknown Title") != .orderedSame else {
+            return LyricsLookupResult(lyrics: nil, logs: ["Lyrics lookup skipped: artist or title is unknown"])
+        }
+
+        var components = URLComponents(string: "https://lrclib.net/api/get")
+        components?.queryItems = [
+            URLQueryItem(name: "track_name", value: title),
+            URLQueryItem(name: "artist_name", value: artist),
+            URLQueryItem(name: "album_name", value: song.displayAlbum == "Unknown Album" ? nil : song.displayAlbum),
+            URLQueryItem(name: "duration", value: song.duration > 0 ? String(Int(song.duration.rounded())) : nil)
+        ].filter { $0.value != nil }
+        guard let url = components?.url else { return LyricsLookupResult(lyrics: nil, logs: ["Lyrics URL could not be created"]) }
+
+        var logs = ["Lyrics query title: \(title)", "Lyrics query artist: \(artist)", "Lyrics request: \(url.absoluteString)"]
+        var request = URLRequest(url: url)
+        request.setValue("OfflineMusic/1.0 (https://github.com/tuhamho/OM-premium)", forHTTPHeaderField: "User-Agent")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            logs.append("Lyrics HTTP status: \(status)")
+            guard status == 200, let decoded = try? JSONDecoder().decode(LRCLIBResponse.self, from: data),
+                  let plainLyrics = decoded.plainLyrics?.trimmingCharacters(in: .whitespacesAndNewlines), !plainLyrics.isEmpty else {
+                logs.append("Lyrics result: not found or invalid")
+                return LyricsLookupResult(lyrics: nil, logs: logs)
+            }
+
+            let matchedTitle = decoded.trackName ?? ""
+            let matchedArtist = decoded.artistName ?? ""
+            let titleScore = similarity(normalize(matchedTitle), normalize(title))
+            let artistScore = similarity(normalize(matchedArtist), normalize(artist))
+            let durationDifference = decoded.duration.map { abs($0 - song.duration) }
+            logs.append("Results found: 1")
+            logs.append("Selected match: \(matchedTitle) — \(matchedArtist)")
+            logs.append(String(format: "Title similarity: %.2f, artist similarity: %.2f", titleScore, artistScore))
+            logs.append(durationDifference.map { String(format: "Duration difference: %.1fs", $0) } ?? "Duration difference: unavailable")
+            guard titleScore >= 0.90, artistScore >= 0.85, durationDifference.map({ $0 <= 10 }) ?? true else {
+                logs.append("Lyrics rejected: confidence too low")
+                return LyricsLookupResult(lyrics: nil, logs: logs)
+            }
+            logs.append("Lyrics characters: \(plainLyrics.count)")
+            logs.append("Cache saved yes")
+            return LyricsLookupResult(lyrics: plainLyrics, logs: logs)
+        } catch {
+            logs.append("Lyrics network error: \(error.localizedDescription)")
+            return LyricsLookupResult(lyrics: nil, logs: logs)
+        }
+    }
+
+    private func normalize(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .filter { $0.isLetter || $0.isNumber }
+    }
+
+    private func similarity(_ lhs: String, _ rhs: String) -> Double {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
+        if lhs == rhs { return 1 }
+        if lhs.contains(rhs) || rhs.contains(lhs) { return 0.9 }
+        return 0
+    }
+}
+
+private struct LRCLIBResponse: Decodable {
+    let trackName: String?
+    let artistName: String?
+    let duration: Double?
+    let plainLyrics: String?
+}
+
+@MainActor final class LyricsSpeechManager: ObservableObject {
+    private let synthesizer = AVSpeechSynthesizer()
+    @Published private(set) var isSpeaking = false
+
+    func read(_ lyrics: String, pauseMusic: @escaping () -> Void) {
+        pauseMusic()
+        synthesizer.stopSpeaking(at: .immediate)
+        let utterance = AVSpeechUtterance(string: lyrics)
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        synthesizer.speak(utterance)
+        isSpeaking = true
+    }
+
+    func pause() { synthesizer.pauseSpeaking(at: .immediate) }
+    func resume() { synthesizer.continueSpeaking() }
+    func stop() { synthesizer.stopSpeaking(at: .immediate); isSpeaking = false }
 }
 
 private struct PersistedState: Codable {

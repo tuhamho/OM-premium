@@ -480,6 +480,21 @@ struct SettingsView: View {
                     }
                     .disabled(store.isFetchingArtwork || store.songs.isEmpty)
 
+                    Button("Fetch Missing Lyrics") {
+                        store.startMissingLyricsFetch()
+                    }
+                    .disabled(store.isFetchingLyrics || store.songs.isEmpty)
+                    if store.isFetchingLyrics {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ProgressView()
+                            Text("Fetching Lyrics \(store.lyricsFetchProgress) / \(store.lyricsFetchTotal)")
+                            Text("Current: \(store.lyricsFetchCurrent)")
+                            Button("Cancel") { store.cancelMissingLyricsFetch() }
+                        }
+                    } else if !store.lyricsFetchSummary.isEmpty {
+                        Text(store.lyricsFetchSummary).foregroundStyle(Color.muted)
+                    }
+
                     if store.isFetchingArtwork {
                         VStack(alignment: .leading, spacing: 6) {
                             ProgressView()
@@ -644,10 +659,14 @@ struct SleepTimerView: View {
 
 struct LyricsView: View {
     @EnvironmentObject private var store: MusicStore
+    @EnvironmentObject private var player: AudioPlayerService
     @Environment(\.dismiss) private var dismiss
     let songID: UUID
     @State private var editing = false
     @State private var draft = ""
+    @State private var isLookingUp = false
+    @State private var debugLines: [String] = []
+    @StateObject private var speech = LyricsSpeechManager()
 
     private var song: Song? { store.song(songID) }
 
@@ -657,9 +676,32 @@ struct LyricsView: View {
                 if editing {
                     TextEditor(text: $draft).padding()
                 } else if let lyrics = song?.lyrics {
-                    ScrollView { Text(lyrics).frame(maxWidth: .infinity, alignment: .leading).padding() }
+                    VStack(spacing: 12) {
+                        ScrollView { Text(lyrics).frame(maxWidth: .infinity, alignment: .leading).padding() }
+                        HStack {
+                            Button("Read") { speech.read(lyrics, pauseMusic: { player.pause() }) }
+                            Button("Pause") { speech.pause() }
+                            Button("Resume") { speech.resume() }
+                            Button("Stop") { speech.stop() }
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 } else {
-                    ContentUnavailableView("No lyrics available", systemImage: "quote.bubble")
+                    VStack(spacing: 14) {
+                        ContentUnavailableView("No lyrics available", systemImage: "quote.bubble")
+                        Button("Find Lyrics Online") { findLyrics() }
+                            .buttonStyle(.borderedProminent).tint(.lime)
+                        Button("Add Lyrics Manually") { draft = ""; editing = true }
+                            .buttonStyle(.bordered)
+                        if isLookingUp { ProgressView("Searching...") }
+                        if !debugLines.isEmpty {
+                            DisclosureGroup("Lookup details") {
+                                ForEach(Array(debugLines.enumerated()), id: \.offset) { _, line in
+                                    Text(line).font(.caption.monospaced()).frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                        }
+                    }
                 }
             }
             .navigationTitle(song?.title ?? "Lyrics")
@@ -671,6 +713,18 @@ struct LyricsView: View {
                         editing.toggle()
                     }
                 }
+                if song?.lyrics != nil && !editing {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            Button("Refresh Online Lyrics") { findLyrics(refresh: true) }
+                            Button("Clear Cached Lyrics") { store.clearCachedLyrics(for: songID) }
+                            if let lyrics = song?.lyrics {
+                                Button("Read Lyrics Aloud") { speech.read(lyrics, pauseMusic: { player.pause() }) }
+                            }
+                            Button("Stop Reading") { speech.stop() }
+                        } label: { Image(systemName: "ellipsis.circle") }
+                    }
+                }
                 if editing, song?.manualLyrics != nil {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Clear Override") { store.updateLyrics(for: songID, manualLyrics: nil); draft = song?.embeddedLyrics ?? "" }
@@ -678,6 +732,16 @@ struct LyricsView: View {
                 }
             }
             .onAppear { draft = song?.lyrics ?? "" }
+            .onDisappear { speech.stop() }
+        }
+    }
+
+    private func findLyrics(refresh: Bool = false) {
+        guard !isLookingUp else { return }
+        isLookingUp = true
+        Task { @MainActor in
+            debugLines = await store.findLyrics(for: songID, refresh: refresh)
+            isLookingUp = false
         }
     }
 }

@@ -10,6 +10,7 @@ struct Song: Identifiable, Codable, Hashable {
     var musicBrainzReleaseID: String?
     var embeddedLyrics: String?
     var manualLyrics: String?
+    var cachedOnlineLyrics: String?
     var genre: String = ""
     var year: Int?
     var duration: Double = 0
@@ -20,7 +21,7 @@ struct Song: Identifiable, Codable, Hashable {
     var playCount: Int = 0
     var isFavorite: Bool = false
 
-    init(id: UUID = UUID(), title: String, artist: String, album: String, albumArtist: String = "", musicBrainzReleaseID: String? = nil, embeddedLyrics: String? = nil, manualLyrics: String? = nil, genre: String = "", year: Int? = nil, duration: Double = 0, fileName: String, artworkData: Data? = nil, importedAt: Date = .now, lastPlayed: Date? = nil, playCount: Int = 0, isFavorite: Bool = false) {
+    init(id: UUID = UUID(), title: String, artist: String, album: String, albumArtist: String = "", musicBrainzReleaseID: String? = nil, embeddedLyrics: String? = nil, manualLyrics: String? = nil, cachedOnlineLyrics: String? = nil, genre: String = "", year: Int? = nil, duration: Double = 0, fileName: String, artworkData: Data? = nil, importedAt: Date = .now, lastPlayed: Date? = nil, playCount: Int = 0, isFavorite: Bool = false) {
         self.id = id
         self.title = title
         self.artist = artist
@@ -29,6 +30,7 @@ struct Song: Identifiable, Codable, Hashable {
         self.musicBrainzReleaseID = musicBrainzReleaseID
         self.embeddedLyrics = embeddedLyrics
         self.manualLyrics = manualLyrics
+        self.cachedOnlineLyrics = cachedOnlineLyrics
         self.genre = genre
         self.year = year
         self.duration = duration
@@ -41,7 +43,7 @@ struct Song: Identifiable, Codable, Hashable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, artist, album, albumArtist, musicBrainzReleaseID, embeddedLyrics, manualLyrics, genre, year, duration, fileName, artworkData, importedAt, lastPlayed, playCount, isFavorite
+        case id, title, artist, album, albumArtist, musicBrainzReleaseID, embeddedLyrics, manualLyrics, cachedOnlineLyrics, genre, year, duration, fileName, artworkData, importedAt, lastPlayed, playCount, isFavorite
     }
 
     init(from decoder: Decoder) throws {
@@ -54,6 +56,7 @@ struct Song: Identifiable, Codable, Hashable {
         musicBrainzReleaseID = try container.decodeIfPresent(String.self, forKey: .musicBrainzReleaseID)
         embeddedLyrics = try container.decodeIfPresent(String.self, forKey: .embeddedLyrics)
         manualLyrics = try container.decodeIfPresent(String.self, forKey: .manualLyrics)
+        cachedOnlineLyrics = try container.decodeIfPresent(String.self, forKey: .cachedOnlineLyrics)
         genre = try container.decodeIfPresent(String.self, forKey: .genre) ?? ""
         year = try container.decodeIfPresent(Int.self, forKey: .year)
         duration = try container.decodeIfPresent(Double.self, forKey: .duration) ?? 0
@@ -75,6 +78,7 @@ struct Song: Identifiable, Codable, Hashable {
         try container.encodeIfPresent(musicBrainzReleaseID, forKey: .musicBrainzReleaseID)
         try container.encodeIfPresent(embeddedLyrics, forKey: .embeddedLyrics)
         try container.encodeIfPresent(manualLyrics, forKey: .manualLyrics)
+        try container.encodeIfPresent(cachedOnlineLyrics, forKey: .cachedOnlineLyrics)
         try container.encode(genre, forKey: .genre)
         try container.encodeIfPresent(year, forKey: .year)
         try container.encode(duration, forKey: .duration)
@@ -92,7 +96,9 @@ struct Song: Identifiable, Codable, Hashable {
         let manual = manualLyrics?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !manual.isEmpty { return manual }
         let embedded = embeddedLyrics?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return embedded.isEmpty ? nil : embedded
+        if !embedded.isEmpty { return embedded }
+        let cached = cachedOnlineLyrics?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return cached.isEmpty ? nil : cached
     }
     var durationText: String {
         let total = Int(duration.rounded())
