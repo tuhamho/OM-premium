@@ -16,9 +16,9 @@ enum PerformanceDiagnostics {
     @Published var savedPosition: Double = 0
     @Published var resumeSession = true
     @Published var oledTheme = false
-    @Published var accent = Color.lime
-    @Published var theme: AppTheme = .system
-    @Published var accentChoice: AccentColorChoice = .green
+    @Published var accent = AccentColorChoice.blue.color
+    @Published var theme: AppTheme = .dark
+    @Published var accentChoice: AccentColorChoice = .blue
     @Published var isScanning = false
     @Published var scanProgress = 0
     @Published var scanTotal = 0
@@ -56,6 +56,7 @@ enum PerformanceDiagnostics {
     private var cachedHomeRecentlyAdded: [Song] = []
     private var cachedHomeAlbums: [Song] = []
     private var cachedHomeFavorites: [Song] = []
+    private var cachedHomeMostPlayed: [Song] = []
     let sleepTimer = SleepTimerManager()
 
     init() {
@@ -106,10 +107,10 @@ enum PerformanceDiagnostics {
         guard let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
         let decodeDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead
         songs = state.songs; playlists = state.playlists; recentlyPlayed = state.recentlyPlayed; currentSongID = state.currentSongID; savedPosition = state.savedPosition
-        theme = AppTheme(rawValue: state.theme ?? "") ?? .system
-        accentChoice = AccentColorChoice(rawValue: state.accentChoice ?? "") ?? .green
+        theme = AppTheme(rawValue: state.theme ?? "") ?? .dark
+        accentChoice = AccentColorChoice(rawValue: state.accentChoice ?? "") ?? .blue
         accent = accentChoice.color
-        oledTheme = state.oledTheme ?? (theme == .dark)
+        oledTheme = state.oledTheme ?? false
         invalidateHomeCache()
         let publishDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead - decodeDuration
         print(String(format: "STARTUP PERF persisted load: %.1fms, decode: %.1fms, publish songs: %.1fms, songs: %d", persistedRead, decodeDuration, publishDuration, songs.count))
@@ -174,6 +175,7 @@ enum PerformanceDiagnostics {
             .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
             .compactMap { $0.value.first }
         cachedHomeFavorites = songs.filter(\.isFavorite)
+        cachedHomeMostPlayed = Array(songs.sorted { $0.playCount > $1.playCount }.prefix(10))
         homeCacheRevision = libraryRevision
     }
 
@@ -181,6 +183,7 @@ enum PerformanceDiagnostics {
     var homeRecentlyAddedSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeRecentlyAdded }
     var homeAlbumSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeAlbums }
     var homeFavoriteSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeFavorites }
+    var homeMostPlayedSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeMostPlayed }
 
     func play(_ song: Song, from list: [Song]? = nil) {
         player?.play(song, from: list)

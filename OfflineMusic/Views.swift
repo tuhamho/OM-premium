@@ -38,9 +38,11 @@ struct RootView: View {
                 case 1: LibraryView()
                 case 2: PlaylistsView()
                 case 3: SettingsView()
-                default: HomeView()
+                default: HomeView { tab = 1 }
                 }
             }
+            .transition(.opacity)
+            .animation(.easeInOut(duration: 0.18), value: tab)
             .safeAreaPadding(.bottom, store.currentSongID == nil ? 62 : 126)
             RootPlayerBar(tab: $tab) { showNowPlaying = true }
         }
@@ -67,6 +69,8 @@ private struct RootPlayerBar: View {
         VStack(spacing: 0) {
             if let song = player.currentSong {
                 MiniPlayer(song: song, open: openNowPlaying)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
             }
             HStack {
                 tabButton("house.fill", "Home", 0)
@@ -75,7 +79,7 @@ private struct RootPlayerBar: View {
                 tabButton("gearshape.fill", "Settings", 3)
             }
             .padding(.top, 10).padding(.bottom, 8)
-            .background(.thinMaterial)
+            .background(.regularMaterial)
         }
     }
 
@@ -93,6 +97,8 @@ private struct RootPlayerBar: View {
                 Text(text).font(.caption2)
             }
             .foregroundStyle(tab == value ? store.accentChoice.color : .secondary)
+            .scaleEffect(tab == value ? 1.04 : 1)
+            .animation(.easeInOut(duration: 0.18), value: tab)
             .frame(maxWidth: .infinity)
         }
         .accessibilityLabel(text)
@@ -102,6 +108,7 @@ private struct RootPlayerBar: View {
 
 struct HomeView: View {
     @EnvironmentObject private var store: MusicStore
+    let openLibrary: () -> Void
 
     private var greeting: String {
         let hour = Calendar.current.component(.hour, from: .now)
@@ -112,18 +119,36 @@ struct HomeView: View {
         NavigationStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 28) {
-                    VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 9) {
+                        Image("SpotufyBrandIcon")
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 30, height: 30)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .accessibilityHidden(true)
                         Text("Spotúfy")
-                            .font(.title3.weight(.bold))
+                            .font(.title2.weight(.bold))
                             .foregroundStyle(store.accentChoice.color)
+                        Spacer()
+                        Button { } label: {
+                            Image(systemName: "bell")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(width: 34, height: 34)
+                                .background(.thinMaterial)
+                                .clipShape(Circle())
+                        }
+                        .accessibilityLabel("Notifications")
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
                         Text(greeting)
-                            .font(.largeTitle.bold())
+                            .font(.system(size: 32, weight: .bold))
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 12)
+                    .padding(.top, 6)
                     if store.songs.isEmpty {
                         EmptyState(title: "Your music, your way", message: "Import local audio files to start building your library.", icon: "waveform")
                     } else {
+                        quickPicks
                         section("Recently Played", songs: store.homeRecentlyPlayedSongs)
                         section("Recently Added", songs: store.homeRecentlyAddedSongs)
                         section("Albums", songs: store.homeAlbumSongs)
@@ -133,11 +158,6 @@ struct HomeView: View {
                 .padding(.horizontal, 20)
             }
             .background(Color(.systemBackground))
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Image(systemName: "bell").foregroundStyle(.white)
-                }
-            }
             .onAppear {
                 let elapsed = Double(DispatchTime.now().uptimeNanoseconds - PerformanceDiagnostics.launchStartedAt) / 1_000_000
                 print(String(format: "HOME PERF open: %.1fms", elapsed))
@@ -149,21 +169,58 @@ struct HomeView: View {
     private func section(_ title: String, songs: [Song]) -> some View {
         if !songs.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
-                Text(title).font(.title3.bold())
-                        ScrollView(.horizontal, showsIndicators: false) {
+                HStack {
+                    Text(title).font(.title3.bold())
+                    Spacer()
+                    Button("See All", action: openLibrary)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .spotufyPressStyle()
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(spacing: SpotufyUI.spacingM) {
-                                ForEach(songs, id: \.id) { song in
-                                    SongCard(song: song) {
-                                        let started = DispatchTime.now().uptimeNanoseconds
-                                        store.play(song, from: songs)
-                                        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-                                        print(String(format: "HOME PERF song tap: %.1fms", elapsed))
-                                    }
-                                }
+                        ForEach(songs, id: \.id) { song in
+                            SongCard(song: song) {
+                                let started = DispatchTime.now().uptimeNanoseconds
+                                store.play(song, from: songs)
+                                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                                print(String(format: "HOME PERF song tap: %.1fms", elapsed))
                             }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private var quickPicks: some View {
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+            quickPick("Favorites", icon: "heart.fill", songs: store.homeFavoriteSongs)
+            quickPick("Recently Added", icon: "clock.fill", songs: store.homeRecentlyAddedSongs)
+            quickPick("Most Played", icon: "chart.bar.fill", songs: store.homeMostPlayedSongs)
+            quickPick("Recently Played", icon: "play.fill", songs: store.homeRecentlyPlayedSongs)
+        }
+    }
+
+    private func quickPick(_ title: String, icon: String, songs: [Song]) -> some View {
+        Button {
+            if let first = songs.first { store.play(first, from: songs) }
+        } label: {
+            HStack(spacing: 9) {
+                ArtworkView(song: songs.first, size: 38)
+                VStack(alignment: .leading, spacing: 2) {
+                    Image(systemName: icon).font(.caption).foregroundStyle(store.accentChoice.color)
+                    Text(title).font(.subheadline.weight(.semibold)).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, minHeight: 62)
+            .background(Color.cardLight.opacity(0.72))
+            .clipShape(RoundedRectangle(cornerRadius: SpotufyUI.smallRadius))
+        }
+        .buttonStyle(.plain)
+        .spotufyPressStyle()
     }
 }
 
@@ -580,7 +637,6 @@ struct SettingsView: View {
                         get: { store.theme },
                         set: {
                             store.theme = $0
-                            store.oledTheme = $0 == .dark
                             store.save()
                         }
                     )) {
@@ -1184,6 +1240,11 @@ struct MiniPlayer: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
             .background(.thinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: SpotufyUI.mediumRadius))
+            .overlay {
+                RoundedRectangle(cornerRadius: SpotufyUI.mediumRadius)
+                    .stroke(.white.opacity(0.08), lineWidth: 1)
+            }
         }
         .buttonStyle(.plain)
         .spotufyPressStyle()
