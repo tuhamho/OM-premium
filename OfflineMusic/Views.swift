@@ -149,6 +149,7 @@ struct HomeView: View {
                         EmptyState(title: "Your music, your way", message: "Import local audio files to start building your library.", icon: "waveform")
                     } else {
                         quickPicks
+                        section("Discover from Your Library", songs: store.dailyDiscoverSongs)
                         section("Recently Played", songs: store.homeRecentlyPlayedSongs)
                         section("Recently Added", songs: store.homeRecentlyAddedSongs)
                         section("Albums", songs: store.homeAlbumSongs)
@@ -661,6 +662,9 @@ struct SettingsView: View {
                     Toggle("Pure black OLED theme", isOn: $store.oledTheme)
                 }
                 Section("Library") {
+                    NavigationLink("Library Insights") {
+                        LibraryInsightsView()
+                    }
                     Button("Test MusicBrainz Connection") {
                         Task { await store.testMusicBrainzConnection() }
                     }
@@ -783,6 +787,182 @@ struct SettingsView: View {
 
     private func speedLabel(for speed: Float) -> String {
         speed == 1.0 ? "1x" : String(format: "%.2gx", speed)
+    }
+}
+
+struct LibraryInsightsView: View {
+    @EnvironmentObject private var store: MusicStore
+
+    private let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 22) {
+                LazyVGrid(columns: columns, spacing: 12) {
+                    insightMetric("Songs", value: store.songs.count.formatted(), icon: "music.note.list")
+                    insightMetric("Artists", value: store.artistGroups.count.formatted(), icon: "person.2")
+                    insightMetric("Albums", value: store.albumGroups.count.formatted(), icon: "square.stack")
+                    insightMetric("Music", value: storageText(store.libraryStorageBytes), icon: "internaldrive")
+                    insightMetric("Favorites", value: store.favoriteSongs.count.formatted(), icon: "heart.fill")
+                    insightMetric("Total Plays", value: store.totalPlayCount.formatted(), icon: "play.fill")
+                }
+
+                NavigationLink {
+                    ListeningStatsView()
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Listening Statistics").font(.headline)
+                            Text("Today, 7 days, and 30 days")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chart.xyaxis.line")
+                            .font(.title2)
+                            .foregroundStyle(store.accentChoice.color)
+                    }
+                    .padding(16)
+                    .background(Color.cardLight.opacity(0.7))
+                    .clipShape(RoundedRectangle(cornerRadius: SpotufyUI.mediumRadius))
+                }
+                .buttonStyle(.plain)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Discover from My Library").font(.headline)
+                    Text("Six local songs selected daily from your existing library.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Text("\(store.dailyDiscoverSongs.count) songs ready today")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(store.accentChoice.color)
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.cardLight.opacity(0.7))
+                .clipShape(RoundedRectangle(cornerRadius: SpotufyUI.mediumRadius))
+            }
+            .padding(20)
+        }
+        .background(Color(.systemBackground))
+        .navigationTitle("Library Insights")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func insightMetric(_ title: String, value: String, icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Image(systemName: icon)
+                .foregroundStyle(store.accentChoice.color)
+            Text(value).font(.title2.bold())
+            Text(title).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 96, alignment: .leading)
+        .padding(14)
+        .background(Color.cardLight.opacity(0.7))
+        .clipShape(RoundedRectangle(cornerRadius: SpotufyUI.mediumRadius))
+    }
+
+    private func storageText(_ bytes: Int64) -> String {
+        let value = Double(bytes)
+        if value >= 1_073_741_824 { return String(format: "%.1f GB", value / 1_073_741_824) }
+        if value >= 1_048_576 { return String(format: "%.0f MB", value / 1_048_576) }
+        if value >= 1024 { return String(format: "%.0f KB", value / 1024) }
+        return "0 MB"
+    }
+}
+
+struct ListeningStatsView: View {
+    @EnvironmentObject private var store: MusicStore
+    @State private var range: ListeningStatsRange = .today
+    @State private var snapshot = ListeningStatsSnapshot()
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 22) {
+                Picker("Range", selection: $range) {
+                    ForEach(ListeningStatsRange.allCases) { value in
+                        Text(value.rawValue).tag(value)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(formatListeningTime(snapshot.listenedSeconds))
+                        .font(.system(size: 34, weight: .bold))
+                    Text("listened in \(range.rawValue.lowercased())")
+                        .foregroundStyle(.secondary)
+                }
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                    statValue("Plays", value: "\(snapshot.plays)")
+                    statValue("Unique", value: "\(snapshot.uniqueSongCount)")
+                    statValue("First listens", value: "\(snapshot.firstListenCount)")
+                }
+
+                statsSection("Top Songs") {
+                    ForEach(snapshot.topSongs) { stat in
+                        if let song = store.song(stat.songID) {
+                            HStack(spacing: 10) {
+                                ArtworkView(song: song, size: 42)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(song.title).lineLimit(1)
+                                    Text("\(stat.plays) plays • \(formatListeningTime(stat.listenedSeconds))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                            }
+                        }
+                    }
+                    if snapshot.topSongs.isEmpty { Text("No qualified listens yet.").foregroundStyle(.secondary) }
+                }
+
+                statsSection("Top Artists") {
+                    ForEach(snapshot.topArtists) { stat in
+                        HStack {
+                            Text(stat.name).lineLimit(1)
+                            Spacer()
+                            Text("\(stat.plays) plays • \(formatListeningTime(stat.listenedSeconds))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if snapshot.topArtists.isEmpty { Text("No artist data yet.").foregroundStyle(.secondary) }
+                }
+            }
+            .padding(20)
+        }
+        .background(Color(.systemBackground))
+        .navigationTitle("Listening Stats")
+        .navigationBarTitleDisplayMode(.inline)
+        .task(id: range) { snapshot = store.listeningStats(for: range) }
+        .onChange(of: store.listeningEvents.count) { _, _ in
+            snapshot = store.listeningStats(for: range)
+        }
+    }
+
+    private func statValue(_ title: String, value: String) -> some View {
+        VStack(spacing: 4) {
+            Text(value).font(.headline)
+            Text(title).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 58)
+        .background(Color.cardLight.opacity(0.7))
+        .clipShape(RoundedRectangle(cornerRadius: SpotufyUI.smallRadius))
+    }
+
+    @ViewBuilder
+    private func statsSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title).font(.headline)
+            content()
+        }
+    }
+
+    private func formatListeningTime(_ seconds: Double) -> String {
+        let minutes = max(0, Int(seconds) / 60)
+        if minutes < 60 { return "\(minutes) min" }
+        return "\(minutes / 60)h \(minutes % 60)m"
     }
 }
 
@@ -1190,16 +1370,31 @@ struct QueueView: View {
                 Section("Playing Now") {
                     if let song = player.currentSong { SongRow(song: song) {} }
                 }
-                Section("Next Up") {
-                    ForEach(player.queue.filter { $0.id != player.currentSong?.id }) { song in
+                if !player.queue.isEmpty {
+                    Section("Play Next") {
+                        ForEach(player.queue, id: \.id) { song in
+                            SongRow(song: song) { player.play(song) }
+                                .swipeActions {
+                                    Button(role: .destructive) { player.removeFromQueue(song) } label: {
+                                        Label("Remove", systemImage: "trash")
+                                    }
+                                }
+                        }
+                        .onMove { offsets, destination in player.movePlayNext(from: offsets, to: destination) }
+                    }
+                }
+                if !player.upcomingRandomSongs.isEmpty {
+                    Section("Next Up") {
+                        ForEach(player.upcomingRandomSongs, id: \.id) { song in
                         SongRow(song: song) { player.play(song) }
                             .swipeActions {
-                                Button(role: .destructive) { player.queue.removeAll { $0.id == song.id } } label: {
+                                Button(role: .destructive) { player.removeFromQueue(song) } label: {
                                     Label("Remove", systemImage: "trash")
                                 }
                             }
+                        }
+                        .onMove { offsets, destination in player.moveUpcomingRandom(from: offsets, to: destination) }
                     }
-                    .onMove { offsets, destination in player.queue.move(fromOffsets: offsets, toOffset: destination) }
                 }
             }
             .environment(\.editMode, .constant(.active))

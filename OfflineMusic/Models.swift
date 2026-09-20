@@ -258,6 +258,47 @@ struct Playlist: Identifiable, Codable, Hashable {
     var createdAt: Date = .now
 }
 
+struct ListeningEvent: Identifiable, Codable, Hashable {
+    var id: UUID = UUID()
+    let songID: UUID
+    let startedAt: Date
+    let endedAt: Date
+    let listenedSeconds: Double
+    let completed: Bool
+    let qualified: Bool
+    let wasFirstListen: Bool
+}
+
+enum ListeningStatsRange: String, CaseIterable, Identifiable {
+    case today = "Today"
+    case week = "7 Days"
+    case month = "30 Days"
+    var id: String { rawValue }
+}
+
+struct ListeningSongStat: Identifiable {
+    let id: UUID
+    let songID: UUID
+    let plays: Int
+    let listenedSeconds: Double
+}
+
+struct ListeningArtistStat: Identifiable {
+    let id: String
+    let name: String
+    let plays: Int
+    let listenedSeconds: Double
+}
+
+struct ListeningStatsSnapshot {
+    var listenedSeconds: Double = 0
+    var plays: Int = 0
+    var uniqueSongCount: Int = 0
+    var firstListenCount: Int = 0
+    var topSongs: [ListeningSongStat] = []
+    var topArtists: [ListeningArtistStat] = []
+}
+
 struct ArtistGroup: Identifiable {
     let id: String
     let name: String

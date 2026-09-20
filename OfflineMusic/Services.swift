@@ -44,6 +44,10 @@ enum PerformanceDiagnostics {
     @Published var lyricsImportSummary = ""
     @Published var unmatchedLyricsFiles: [String] = []
     @Published private(set) var lyricsRevision = UUID()
+    @Published private(set) var listeningEvents: [ListeningEvent] = []
+    @Published private(set) var firstQualifiedListenIDs: Set<UUID> = []
+    @Published private(set) var discoverSongIDs: [UUID] = []
+    @Published private(set) var discoverDateKey = ""
 
     private let stateURL: URL
     private let fm = FileManager.default
@@ -115,11 +119,16 @@ enum PerformanceDiagnostics {
         guard let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
         let decodeDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead
         songs = state.songs; playlists = state.playlists; recentlyPlayed = state.recentlyPlayed; currentSongID = state.currentSongID; savedPosition = state.savedPosition
+        listeningEvents = state.listeningEvents ?? []
+        firstQualifiedListenIDs = Set(state.firstQualifiedListenIDs ?? [])
+        discoverSongIDs = state.discoverSongIDs ?? []
+        discoverDateKey = state.discoverDateKey ?? ""
         theme = AppTheme(rawValue: state.theme ?? "") ?? .dark
         accentChoice = AccentColorChoice(rawValue: state.accentChoice ?? "") ?? .blue
         accent = accentChoice.color
         oledTheme = state.oledTheme ?? false
         invalidateHomeCache()
+        ensureDailyDiscover()
         let publishDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead - decodeDuration
         print(String(format: "STARTUP PERF persisted load: %.1fms, decode: %.1fms, publish songs: %.1fms, songs: %d", persistedRead, decodeDuration, publishDuration, songs.count))
         let artworkVersion = state.artworkMatchingVersion
@@ -152,7 +161,7 @@ enum PerformanceDiagnostics {
 
     func save() {
         let startedAt = DispatchTime.now().uptimeNanoseconds
-        let state = PersistedState(songs: songs, playlists: playlists, recentlyPlayed: recentlyPlayed, currentSongID: currentSongID, savedPosition: savedPosition, artworkMatchingVersion: ArtworkMatchingConfiguration.version, theme: theme.rawValue, accentChoice: accentChoice.rawValue, oledTheme: oledTheme)
+        let state = PersistedState(songs: songs, playlists: playlists, recentlyPlayed: recentlyPlayed, currentSongID: currentSongID, savedPosition: savedPosition, artworkMatchingVersion: ArtworkMatchingConfiguration.version, theme: theme.rawValue, accentChoice: accentChoice.rawValue, oledTheme: oledTheme, listeningEvents: listeningEvents, firstQualifiedListenIDs: Array(firstQualifiedListenIDs), discoverDateKey: discoverDateKey, discoverSongIDs: discoverSongIDs)
         if let data = try? JSONEncoder().encode(state) { try? data.write(to: stateURL, options: .atomic) }
         let duration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
         if duration > 30 { print(String(format: "PERF save library JSON: %.1fms", duration)) }
@@ -193,6 +202,120 @@ enum PerformanceDiagnostics {
     var homeFavoriteSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeFavorites }
     var homeMostPlayedSongs: [Song] { rebuildHomeCacheIfNeeded(); return cachedHomeMostPlayed }
 
+    var dailyDiscoverSongs: [Song] { discoverSongIDs.compactMap(song) }
+    var libraryStorageBytes: Int64 { songs.reduce(0) { $0 + ($1.fileFingerprint?.fileSize ?? 0) } }
+    var totalPlayCount: Int { songs.reduce(0) { $0 + $1.playCount } }
+
+    private var localDayKey: String {
+        let components = Calendar.current.dateComponents([.year, .month, .day], from: .now)
+        return "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
+    }
+
+    func ensureDailyDiscover() {
+        guard !songs.isEmpty else {
+            discoverSongIDs = []
+            return
+        }
+        let today = localDayKey
+        let availableIDs = Set(songs.map(\.id))
+        let validCount = Set(discoverSongIDs).intersection(availableIDs).count
+        let desiredCount = min(6, songs.count)
+        guard discoverDateKey != today || validCount != discoverSongIDs.count || discoverSongIDs.count < desiredCount else { return }
+
+        let currentID = currentSongID
+        let pool = songs.filter { song in
+            song.id != currentID || songs.count <= 6
+        }
+        let ranked = pool.sorted { lhs, rhs in
+            discoverScore(lhs, dayKey: today) > discoverScore(rhs, dayKey: today)
+        }
+        var selected: [Song] = []
+        var selectedArtists = Set<String>()
+        for song in ranked {
+            guard selected.count < 6 else { break }
+            let artistKey = self.artistKey(for: song.displayArtist)
+            if !selectedArtists.contains(artistKey) || ranked.count - selected.count <= 6 - selected.count {
+                selected.append(song)
+                selectedArtists.insert(artistKey)
+            }
+        }
+        if selected.count < min(6, ranked.count) {
+            for song in ranked where !selected.contains(where: { $0.id == song.id }) {
+                selected.append(song)
+                if selected.count == 6 { break }
+            }
+        }
+        discoverDateKey = today
+        discoverSongIDs = selected.map(\.id)
+        scheduleSave()
+    }
+
+    private func discoverScore(_ song: Song, dayKey: String) -> Int {
+        let recencyScore: Int
+        if let lastPlayed = song.lastPlayed {
+            recencyScore = max(0, Int(Date().timeIntervalSince(lastPlayed) / 86_400)) * 100
+        } else {
+            recencyScore = 100_000
+        }
+        let playScore = max(0, 10_000 - song.playCount * 100)
+        let tieBreak = abs((song.id.uuidString + dayKey).hashValue % 97)
+        return recencyScore + playScore + tieBreak
+    }
+
+    func recordListeningEvent(songID: UUID, startedAt: Date, endedAt: Date, listenedSeconds: Double, duration: Double, completed: Bool) {
+        let safeSeconds = max(0, listenedSeconds.isFinite ? listenedSeconds : 0)
+        let qualified = safeSeconds >= 30 || (duration > 0 && safeSeconds >= duration * 0.5)
+        let wasFirst = qualified && firstQualifiedListenIDs.insert(songID).inserted
+        listeningEvents.append(ListeningEvent(songID: songID, startedAt: startedAt, endedAt: endedAt, listenedSeconds: safeSeconds, completed: completed, qualified: qualified, wasFirstListen: wasFirst))
+        if listeningEvents.count > 10_000 {
+            listeningEvents.removeFirst(listeningEvents.count - 10_000)
+        }
+        scheduleSave()
+    }
+
+    func listeningStats(for range: ListeningStatsRange) -> ListeningStatsSnapshot {
+        let calendar = Calendar.current
+        let now = Date()
+        let start: Date
+        switch range {
+        case .today: start = calendar.startOfDay(for: now)
+        case .week: start = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now)) ?? now
+        case .month: start = calendar.date(byAdding: .day, value: -29, to: calendar.startOfDay(for: now)) ?? now
+        }
+        let events = listeningEvents.filter { $0.endedAt >= start && $0.endedAt <= now }
+        var snapshot = ListeningStatsSnapshot()
+        snapshot.listenedSeconds = events.reduce(0) { $0 + $1.listenedSeconds }
+        let qualifiedEvents = events.filter(\.qualified)
+        snapshot.plays = qualifiedEvents.count
+        snapshot.uniqueSongCount = Set(qualifiedEvents.map(\.songID)).count
+        snapshot.firstListenCount = events.filter(\.wasFirstListen).count
+
+        var songsByID: [UUID: (plays: Int, seconds: Double)] = [:]
+        for event in qualifiedEvents {
+            let current = songsByID[event.songID] ?? (0, 0)
+            songsByID[event.songID] = (current.plays + 1, current.seconds + event.listenedSeconds)
+        }
+        snapshot.topSongs = songsByID.map { id, value in
+            ListeningSongStat(id: id, songID: id, plays: value.plays, listenedSeconds: value.seconds)
+        }.sorted {
+            $0.plays == $1.plays ? $0.listenedSeconds > $1.listenedSeconds : $0.plays > $1.plays
+        }.prefix(10).map { $0 }
+
+        var artistsByKey: [String: (name: String, plays: Int, seconds: Double)] = [:]
+        for event in qualifiedEvents {
+            let artist = song(event.songID)?.displayArtist ?? "Unknown Artist"
+            let key = artistKey(for: artist)
+            let current = artistsByKey[key] ?? (displayArtistName(from: [Song(title: "", artist: artist, album: "", fileName: "")]), 0, 0)
+            artistsByKey[key] = (current.name, current.plays + 1, current.seconds + event.listenedSeconds)
+        }
+        snapshot.topArtists = artistsByKey.map { key, value in
+            ListeningArtistStat(id: key, name: value.name, plays: value.plays, listenedSeconds: value.seconds)
+        }.sorted {
+            $0.listenedSeconds == $1.listenedSeconds ? $0.plays > $1.plays : $0.listenedSeconds > $1.listenedSeconds
+        }.prefix(10).map { $0 }
+        return snapshot
+    }
+
     func play(_ song: Song, from list: [Song]? = nil) {
         player?.play(song, from: list)
     }
@@ -230,7 +353,7 @@ enum PerformanceDiagnostics {
                 imported += 1
             } catch { continue }
         }
-        if imported > 0 { invalidateHomeCache() }
+        if imported > 0 { invalidateHomeCache(); ensureDailyDiscover() }
         save()
         return imported
     }
@@ -309,6 +432,7 @@ enum PerformanceDiagnostics {
 
         if !removedIDs.isEmpty || added > 0 || modified > 0 {
             invalidateHomeCache()
+            ensureDailyDiscover()
             save()
             objectWillChange.send()
         }
@@ -384,6 +508,7 @@ enum PerformanceDiagnostics {
 
         save()
         invalidateHomeCache()
+        ensureDailyDiscover()
         isScanning = false
         scanMessage = "Scan complete — \(songs.count) songs found"
         print("Library songs:", songs.count, "(imported:", importedCount, ")")
@@ -397,11 +522,12 @@ enum PerformanceDiagnostics {
             playlists[index].songIDs.removeAll { removed.contains($0) }
         }
         if let player {
-            player.queue.removeAll { removed.contains($0.id) }
+            player.removeSongs(removed)
             if let currentID = player.currentSong?.id, removed.contains(currentID) { player.pause() }
         }
         if currentSongID.map(removed.contains) == true { currentSongID = nil }
         invalidateHomeCache()
+        ensureDailyDiscover()
     }
 
     func identifyAndFetchArtwork(for id: UUID) async {
@@ -1279,6 +1405,10 @@ private struct PersistedState: Codable {
     var theme: String?
     var accentChoice: String?
     var oledTheme: Bool?
+    var listeningEvents: [ListeningEvent]?
+    var firstQualifiedListenIDs: [UUID]?
+    var discoverDateKey: String?
+    var discoverSongIDs: [UUID]?
 }
 
 struct MetadataService {
@@ -2037,6 +2167,7 @@ private struct MusicBrainzRelease: Decodable {
     @Published var elapsed: Double = 0
     @Published var duration: Double = 0
     @Published var queue: [Song] = []
+    @Published private(set) var upcomingRandomIDs: [UUID] = []
     @Published var repeatMode: RepeatMode = .off
     @Published var shuffle = false
     @Published var speed: Float = UserDefaults.standard.object(forKey: "playbackSpeed") as? Float ?? 1
@@ -2046,11 +2177,14 @@ private struct MusicBrainzRelease: Decodable {
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var playbackContextIDs: [UUID] = []
-    private var randomPlayedIDs: Set<UUID> = []
     private var playbackHistory: [UUID] = []
     private var historyIndex = -1
     private var manualQueueIDs: Set<UUID> = []
     private var nowPlayingArtworkTask: Task<Void, Never>?
+    private var listeningSongID: UUID?
+    private var listeningStartedAt: Date?
+    private var listeningLastTickAt: Date?
+    private var listeningSeconds = 0.0
 
     func configure(with store: MusicStore) {
         self.store = store
@@ -2060,10 +2194,10 @@ private struct MusicBrainzRelease: Decodable {
             duration = restored.duration
             elapsed = clampedPosition(store.savedPosition, for: restored)
             playbackContextIDs = store.songs.map(\.id)
-            randomPlayedIDs = [restored.id]
             playbackHistory = [restored.id]
             historyIndex = 0
-            queue = store.songs
+            queue = []
+            upcomingRandomIDs = store.songs.map(\.id).filter { $0 != restored.id }.shuffled()
         }
         isPlaying = false
         player = nil
@@ -2109,6 +2243,51 @@ private struct MusicBrainzRelease: Decodable {
         print("Playback file not found: \(song.fileName)")
     }
 
+    private func beginListeningSession(for song: Song) {
+        listeningSongID = song.id
+        listeningStartedAt = Date()
+        listeningLastTickAt = Date()
+        listeningSeconds = 0
+    }
+
+    private func accumulateListeningTime() {
+        guard isPlaying, player?.timeControlStatus == .playing, listeningSongID != nil else {
+            listeningLastTickAt = Date()
+            return
+        }
+        let now = Date()
+        if let last = listeningLastTickAt {
+            listeningSeconds += min(max(0, now.timeIntervalSince(last)), 1.0)
+        }
+        listeningLastTickAt = now
+    }
+
+    private func finalizeListeningSession(completed: Bool) {
+        accumulateListeningTime()
+        guard let songID = listeningSongID,
+              let startedAt = listeningStartedAt,
+              listeningSeconds > 0 else {
+            listeningSongID = nil
+            listeningStartedAt = nil
+            listeningLastTickAt = nil
+            listeningSeconds = 0
+            return
+        }
+        let song = store?.song(songID)
+        store?.recordListeningEvent(
+            songID: songID,
+            startedAt: startedAt,
+            endedAt: Date(),
+            listenedSeconds: listeningSeconds,
+            duration: song?.duration ?? 0,
+            completed: completed
+        )
+        listeningSongID = nil
+        listeningStartedAt = nil
+        listeningLastTickAt = nil
+        listeningSeconds = 0
+    }
+
     func play(_ song: Song, from list: [Song]? = nil) {
         let tapStartedAt = DispatchTime.now().uptimeNanoseconds
         if currentSong?.id == song.id, list == nil {
@@ -2125,17 +2304,20 @@ private struct MusicBrainzRelease: Decodable {
         let context = deduplicated(list ?? [song])
         let resolvedContext = context.isEmpty ? [song] : context
         playbackContextIDs = resolvedContext.map(\.id)
-        randomPlayedIDs = [song.id]
         playbackHistory = [song.id]
         historyIndex = 0
         manualQueueIDs.removeAll()
-        queue = resolvedContext
+        queue = []
+        upcomingRandomIDs = resolvedContext.map(\.id).filter { $0 != song.id }.shuffled()
         load(song, recordHistory: false, startAt: 0)
         let duration = Double(DispatchTime.now().uptimeNanoseconds - tapStartedAt) / 1_000_000
         print(String(format: "PLAY PERF tap -> play() called: %.1fms, context IDs: %d", duration, playbackContextIDs.count))
     }
 
     private func load(_ song: Song, recordHistory: Bool, startAt: Double? = nil) {
+        if currentSong?.id != song.id {
+            finalizeListeningSession(completed: false)
+        }
         if recordHistory {
             if historyIndex < playbackHistory.count - 1 {
                 playbackHistory = Array(playbackHistory.prefix(historyIndex + 1))
@@ -2164,7 +2346,10 @@ private struct MusicBrainzRelease: Decodable {
             self.endObserver = nil
         }
         let item = AVPlayerItem(url: url); player = AVPlayer(playerItem: item); player?.rate = speed
-        timeObserver = player?.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in self?.elapsed = time.seconds }
+        timeObserver = player?.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in
+            self?.accumulateListeningTime()
+            self?.elapsed = time.seconds
+        }
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in self?.advance() }
         if elapsed > 0 {
             player?.seek(to: CMTime(seconds: elapsed, preferredTimescale: 600))
@@ -2172,6 +2357,7 @@ private struct MusicBrainzRelease: Decodable {
         updateNowPlaying()
         player?.play()
         isPlaying = true
+        beginListeningSession(for: song)
         store?.markPlayed(song.id)
         let duration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
         if duration > 30 { print(String(format: "PERF player setup: %.1fms", duration)) }
@@ -2183,12 +2369,19 @@ private struct MusicBrainzRelease: Decodable {
         store?.scheduleSave()
     }
 
-    func pause() { player?.pause(); isPlaying = false; persistPosition(); updateNowPlaying() }
+    func pause() {
+        finalizeListeningSession(completed: false)
+        player?.pause()
+        isPlaying = false
+        persistPosition()
+        updateNowPlaying()
+    }
     func resume() {
         guard let currentSong else { return }
         if hasLoadedCurrentSong {
             player?.play()
             isPlaying = true
+            if listeningSongID == nil { beginListeningSession(for: currentSong) }
             updateNowPlaying()
         } else {
             load(currentSong, recordHistory: false, startAt: store?.savedPosition ?? elapsed)
@@ -2205,46 +2398,90 @@ private struct MusicBrainzRelease: Decodable {
     func next() { advance() }
     private func advance() {
         guard let current = currentSong else { return }
+        finalizeListeningSession(completed: true)
         if store?.sleepTimer.currentSongEnded() == true { return }
         if repeatMode == .one { seek(to: 0); resume(); return }
 
-        if let next = nextManualSong(after: current) {
-            manualQueueIDs.remove(current.id)
+        let explicitNext = queue.first
+        let randomNextID: UUID?
+        if explicitNext == nil, upcomingRandomIDs.isEmpty {
+            upcomingRandomIDs = playbackContextIDs.filter { $0 != current.id }.shuffled()
+        }
+        randomNextID = explicitNext == nil ? upcomingRandomIDs.first : nil
+
+        if let next = explicitNext {
+#if DEBUG
+            debugAdvance(current: current, chosen: next)
+#endif
+            queue.removeFirst()
+            manualQueueIDs.remove(next.id)
             load(next, recordHistory: true)
             return
         }
 
-        guard let next = nextRandomSong(excluding: current.id) else {
+        guard let randomNextID, let next = store?.song(randomNextID) else {
             pause()
             seek(to: 0)
             return
         }
-        randomPlayedIDs.insert(next.id)
+#if DEBUG
+        debugAdvance(current: current, chosen: next)
+#endif
+        upcomingRandomIDs.removeFirst()
         load(next, recordHistory: true)
     }
 
-    private func nextManualSong(after current: Song) -> Song? {
-        guard let index = queue.firstIndex(where: { $0.id == current.id }) else {
-            return queue.first(where: { manualQueueIDs.contains($0.id) })
-        }
-        return queue.dropFirst(index + 1).first(where: { manualQueueIDs.contains($0.id) })
+#if DEBUG
+    private func debugAdvance(current: Song, chosen: Song) {
+        let explicit = queue.map(\.title)
+        let random = upcomingRandomIDs.compactMap { store?.song($0)?.title }
+        let uiFirst = upcomingSongs.first?.title ?? "none"
+        print("QUEUE ADVANCE")
+        print("Current: \(current.title)")
+        print("Explicit Play Next: \(explicit)")
+        print("Random Upcoming: \(random)")
+        print("Chosen Next: \(chosen.title)")
+        print("Queue UI First Item: \(uiFirst)")
     }
-
-    private func nextRandomSong(excluding currentID: UUID) -> Song? {
-        let candidates = playbackContextIDs.filter { $0 != currentID && !randomPlayedIDs.contains($0) }
-        if let nextID = candidates.randomElement(), let next = store?.song(nextID) { return next }
-        randomPlayedIDs = [currentID]
-        guard let nextID = playbackContextIDs.filter({ $0 != currentID }).randomElement() else { return nil }
-        return store?.song(nextID)
-    }
+#endif
 
     private func deduplicated(_ songs: [Song]) -> [Song] {
         var seen = Set<UUID>()
         return songs.filter { seen.insert($0.id).inserted }
     }
 
+    var upcomingRandomSongs: [Song] {
+        upcomingRandomIDs.compactMap { store?.song($0) }
+    }
+
+    var upcomingSongs: [Song] {
+        queue + upcomingRandomSongs
+    }
+
+    func removeFromQueue(_ song: Song) {
+        queue.removeAll { $0.id == song.id }
+        manualQueueIDs.remove(song.id)
+        upcomingRandomIDs.removeAll { $0 == song.id }
+    }
+
+    func movePlayNext(from offsets: IndexSet, to destination: Int) {
+        queue.move(fromOffsets: offsets, toOffset: destination)
+    }
+
+    func moveUpcomingRandom(from offsets: IndexSet, to destination: Int) {
+        upcomingRandomIDs.move(fromOffsets: offsets, toOffset: destination)
+    }
+
+    func removeSongs(_ ids: Set<UUID>) {
+        queue.removeAll { ids.contains($0.id) }
+        manualQueueIDs.subtract(ids)
+        playbackContextIDs.removeAll { ids.contains($0) }
+        upcomingRandomIDs.removeAll { ids.contains($0) }
+    }
+
     func addToQueue(_ song: Song) {
         guard !queue.contains(where: { $0.id == song.id }) else { return }
+        upcomingRandomIDs.removeAll { $0 == song.id }
         queue.append(song)
         manualQueueIDs.insert(song.id)
     }
@@ -2252,17 +2489,15 @@ private struct MusicBrainzRelease: Decodable {
     func playNext(_ song: Song) {
         queue.removeAll { $0.id == song.id }
         manualQueueIDs.remove(song.id)
-        if let currentSong, let index = queue.firstIndex(where: { $0.id == currentSong.id }) {
-            queue.insert(song, at: index + 1)
-        } else {
-            queue.insert(song, at: 0)
-        }
+        upcomingRandomIDs.removeAll { $0 == song.id }
+        queue.insert(song, at: 0)
         manualQueueIDs.insert(song.id)
     }
 
     func clearQueue() {
         manualQueueIDs.removeAll()
-        if let currentSong { queue = [currentSong] } else { queue.removeAll() }
+        queue.removeAll()
+        upcomingRandomIDs.removeAll()
     }
     func setRate(_ rate: Float) { speed = rate; UserDefaults.standard.set(rate, forKey: "playbackSpeed"); player?.rate = isPlaying ? rate : 0; if !isPlaying { player?.pause() } }
     private func updateNowPlaying() {
