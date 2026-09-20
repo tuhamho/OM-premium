@@ -4,6 +4,10 @@ import MediaPlayer
 import SwiftUI
 import UIKit
 
+enum PerformanceDiagnostics {
+    static let launchStartedAt = DispatchTime.now().uptimeNanoseconds
+}
+
 @MainActor final class MusicStore: ObservableObject {
     @Published var songs: [Song] = []
     @Published var playlists: [Playlist] = []
@@ -43,6 +47,7 @@ import UIKit
     private let fm = FileManager.default
     private weak var player: AudioPlayerService?
     private var enrichmentRunID = UUID()
+    private var saveTask: Task<Void, Never>?
     let sleepTimer = SleepTimerManager()
 
     init() {
@@ -87,8 +92,14 @@ import UIKit
     }
 
     func load() async {
-        guard let data = try? Data(contentsOf: stateURL), let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        guard let data = try? Data(contentsOf: stateURL) else { return }
+        let persistedRead = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+        guard let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
+        let decodeDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead
         songs = state.songs; playlists = state.playlists; recentlyPlayed = state.recentlyPlayed; currentSongID = state.currentSongID; savedPosition = state.savedPosition
+        let publishDuration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000 - persistedRead - decodeDuration
+        print(String(format: "STARTUP PERF persisted load: %.1fms, decode: %.1fms, publish songs: %.1fms, songs: %d", persistedRead, decodeDuration, publishDuration, songs.count))
         let artworkVersion = state.artworkMatchingVersion
         Task { @MainActor [weak self] in
             await self?.restoreArtworkAfterLaunch(version: artworkVersion)
@@ -118,12 +129,36 @@ import UIKit
     }
 
     func save() {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
         let state = PersistedState(songs: songs, playlists: playlists, recentlyPlayed: recentlyPlayed, currentSongID: currentSongID, savedPosition: savedPosition, artworkMatchingVersion: ArtworkMatchingConfiguration.version)
         if let data = try? JSONEncoder().encode(state) { try? data.write(to: stateURL, options: .atomic) }
+        let duration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+        if duration > 30 { print(String(format: "PERF save library JSON: %.1fms", duration)) }
+    }
+
+    func scheduleSave() {
+        saveTask?.cancel()
+        saveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            guard !Task.isCancelled else { return }
+            self?.save()
+        }
     }
 
     func attach(player: AudioPlayerService) {
         self.player = player
+    }
+
+    func play(_ song: Song, from list: [Song]? = nil) {
+        player?.play(song, from: list)
+    }
+
+    func playNext(_ song: Song) {
+        player?.playNext(song)
+    }
+
+    func addToQueue(_ song: Song) {
+        player?.addToQueue(song)
     }
 
     func startSongDebug(_ song: Song) {
@@ -164,9 +199,11 @@ import UIKit
 
         let startedAt = Date()
         let documentsURL = documentsDirectory
+        let filesystemCheckStarted = DispatchTime.now().uptimeNanoseconds
         let audioFiles = await Task.detached(priority: .utility) {
             Self.enumerateAudioFiles(in: documentsURL)
         }.value
+        let filesystemCheckDuration = Double(DispatchTime.now().uptimeNanoseconds - filesystemCheckStarted) / 1_000_000
         let currentPaths = Set(audioFiles.map { relativeDocumentPath(for: $0) })
         let knownPaths = Set(songs.map(\.fileName))
         let removedIDs = songs.compactMap { song in
@@ -231,7 +268,8 @@ import UIKit
         }
         let duration = Date().timeIntervalSince(startedAt)
         let durationText = String(format: "%.2fs", duration)
-        print("Startup library: Persisted songs: \(knownPaths.count), Filesystem audio files: \(audioFiles.count), Unchanged: \(unchanged), Added: \(added), Modified: \(modified), Removed: \(removedIDs.count), Metadata rereads: \(metadataRereads), Startup sync duration: \(durationText)")
+        let filesystemCheckText = String(format: "%.1fms", filesystemCheckDuration)
+        print("STARTUP PERF filesystem check: \(filesystemCheckText), persisted: \(knownPaths.count), files: \(audioFiles.count), unchanged: \(unchanged), added: \(added), modified: \(modified), removed: \(removedIDs.count), metadata rereads: \(metadataRereads), total: \(durationText)")
     }
 
     func rescanDocuments() async {
@@ -709,7 +747,7 @@ import UIKit
             return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }
     }
-    func markPlayed(_ id: UUID) { update(id) { $0.playCount += 1; $0.lastPlayed = .now }; recentlyPlayed.removeAll { $0 == id }; recentlyPlayed.insert(id, at: 0); recentlyPlayed = Array(recentlyPlayed.prefix(30)); currentSongID = id; save() }
+    func markPlayed(_ id: UUID) { update(id) { $0.playCount += 1; $0.lastPlayed = .now }; recentlyPlayed.removeAll { $0 == id }; recentlyPlayed.insert(id, at: 0); recentlyPlayed = Array(recentlyPlayed.prefix(30)); currentSongID = id; scheduleSave() }
     func delete(_ song: Song) { try? fm.removeItem(at: documentURL(for: song.fileName)); songs.removeAll { $0.id == song.id }; playlists.indices.forEach { playlists[$0].songIDs.removeAll { $0 == song.id } }; save() }
     func addPlaylist(name: String) { playlists.append(Playlist(name: name)); save() }
     func addSong(_ songID: UUID, to playlistID: UUID) {
@@ -1952,11 +1990,12 @@ private struct MusicBrainzRelease: Decodable {
     private weak var store: MusicStore?
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
-    private var playbackContext: [Song] = []
+    private var playbackContextIDs: [UUID] = []
     private var randomPlayedIDs: Set<UUID> = []
     private var playbackHistory: [UUID] = []
     private var historyIndex = -1
     private var manualQueueIDs: Set<UUID> = []
+    private var nowPlayingArtworkTask: Task<Void, Never>?
 
     func configure(with store: MusicStore) {
         self.store = store
@@ -1965,11 +2004,11 @@ private struct MusicBrainzRelease: Decodable {
             currentSong = restored
             duration = restored.duration
             elapsed = store.savedPosition
-            playbackContext = store.songs
+            playbackContextIDs = store.songs.map(\.id)
             randomPlayedIDs = [restored.id]
             playbackHistory = [restored.id]
             historyIndex = 0
-            queue = playbackContext
+            queue = store.songs
         }
         configureAudioSession(); configureRemoteCommands()
     }
@@ -1981,18 +2020,24 @@ private struct MusicBrainzRelease: Decodable {
     private func configureAudioSession() { try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: []); try? AVAudioSession.sharedInstance().setActive(true) }
 
     func play(_ song: Song, from list: [Song]? = nil) {
+        let tapStartedAt = DispatchTime.now().uptimeNanoseconds
         if currentSong?.id == song.id, list == nil {
             if !isPlaying { player?.play(); isPlaying = true }
+            let duration = Double(DispatchTime.now().uptimeNanoseconds - tapStartedAt) / 1_000_000
+            print(String(format: "PLAY PERF tap -> resume: %.1fms", duration))
             return
         }
         let context = deduplicated(list ?? [song])
-        playbackContext = context.isEmpty ? [song] : context
+        let resolvedContext = context.isEmpty ? [song] : context
+        playbackContextIDs = resolvedContext.map(\.id)
         randomPlayedIDs = [song.id]
         playbackHistory = [song.id]
         historyIndex = 0
         manualQueueIDs.removeAll()
-        queue = playbackContext
+        queue = resolvedContext
         load(song, recordHistory: false)
+        let duration = Double(DispatchTime.now().uptimeNanoseconds - tapStartedAt) / 1_000_000
+        print(String(format: "PLAY PERF tap -> play() called: %.1fms, context IDs: %d", duration, playbackContextIDs.count))
     }
 
     private func load(_ song: Song, recordHistory: Bool) {
@@ -2003,17 +2048,28 @@ private struct MusicBrainzRelease: Decodable {
             playbackHistory.append(song.id)
             historyIndex = playbackHistory.count - 1
         }
-        currentSong = song; duration = song.duration; store?.markPlayed(song.id); elapsed = 0
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        currentSong = song; duration = song.duration; elapsed = 0
         let url = store?.documentURL(for: song.fileName)
         guard let url else { return }
-        player?.pause(); if let timeObserver { player?.removeTimeObserver(timeObserver) }
+        player?.pause()
+        if let timeObserver { player?.removeTimeObserver(timeObserver) }
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+            self.endObserver = nil
+        }
         let item = AVPlayerItem(url: url); player = AVPlayer(playerItem: item); player?.rate = speed
         timeObserver = player?.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in self?.elapsed = time.seconds }
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in self?.advance() }
-        updateNowPlaying(); player?.play(); isPlaying = true
+        updateNowPlaying()
+        player?.play()
+        isPlaying = true
+        store?.markPlayed(song.id)
+        let duration = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+        if duration > 30 { print(String(format: "PERF player setup: %.1fms", duration)) }
     }
     func toggle() { isPlaying ? pause() : resume() }
-    func pause() { player?.pause(); isPlaying = false; store?.savedPosition = elapsed; store?.save(); updateNowPlaying() }
+    func pause() { player?.pause(); isPlaying = false; store?.savedPosition = elapsed; store?.scheduleSave(); updateNowPlaying() }
     func resume() { player?.play(); isPlaying = true; updateNowPlaying() }
     func seek(to value: Double) { player?.seek(to: CMTime(seconds: value, preferredTimescale: 600)); elapsed = value; updateNowPlaying() }
     func previous() {
@@ -2052,10 +2108,11 @@ private struct MusicBrainzRelease: Decodable {
     }
 
     private func nextRandomSong(excluding currentID: UUID) -> Song? {
-        let candidates = playbackContext.filter { $0.id != currentID && !randomPlayedIDs.contains($0.id) }
-        if let next = candidates.randomElement() { return next }
+        let candidates = playbackContextIDs.filter { $0 != currentID && !randomPlayedIDs.contains($0) }
+        if let nextID = candidates.randomElement(), let next = store?.song(nextID) { return next }
         randomPlayedIDs = [currentID]
-        return playbackContext.filter { $0.id != currentID }.randomElement()
+        guard let nextID = playbackContextIDs.filter({ $0 != currentID }).randomElement() else { return nil }
+        return store?.song(nextID)
     }
 
     private func deduplicated(_ songs: [Song]) -> [Song] {
@@ -2085,6 +2142,31 @@ private struct MusicBrainzRelease: Decodable {
         if let currentSong { queue = [currentSong] } else { queue.removeAll() }
     }
     func setRate(_ rate: Float) { speed = rate; UserDefaults.standard.set(rate, forKey: "playbackSpeed"); player?.rate = isPlaying ? rate : 0; if !isPlaying { player?.pause() } }
-    private func updateNowPlaying() { guard let song = currentSong else { return }; var info: [String: Any] = [MPMediaItemPropertyTitle: song.title, MPMediaItemPropertyArtist: song.displayArtist, MPMediaItemPropertyAlbumTitle: song.displayAlbum, MPMediaItemPropertyPlaybackDuration: max(duration, song.duration), MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed, MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? speed : 0]; if let data = song.artworkData, let image = UIImage(data: data) { info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image } }; MPNowPlayingInfoCenter.default().nowPlayingInfo = info }
+    private func updateNowPlaying() {
+        guard let song = currentSong else { return }
+        let info: [String: Any] = [
+            MPMediaItemPropertyTitle: song.title,
+            MPMediaItemPropertyArtist: song.displayArtist,
+            MPMediaItemPropertyAlbumTitle: song.displayAlbum,
+            MPMediaItemPropertyPlaybackDuration: max(duration, song.duration),
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? speed : 0
+        ]
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+
+        nowPlayingArtworkTask?.cancel()
+        guard let data = song.artworkData else { return }
+        let songID = song.id
+        nowPlayingArtworkTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled,
+                  let self,
+                  self.currentSong?.id == songID,
+                  let image = UIImage(data: data) else { return }
+            var artworkInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? info
+            artworkInfo[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = artworkInfo
+        }
+    }
     private func configureRemoteCommands() { let c = MPRemoteCommandCenter.shared(); c.playCommand.addTarget { [weak self] _ in self?.resume(); return .success }; c.pauseCommand.addTarget { [weak self] _ in self?.pause(); return .success }; c.nextTrackCommand.addTarget { [weak self] _ in self?.next(); return .success }; c.previousTrackCommand.addTarget { [weak self] _ in self?.previous(); return .success }; c.changePlaybackPositionCommand.addTarget { [weak self] event in if let e = event as? MPChangePlaybackPositionCommandEvent { self?.seek(to: e.positionTime) }; return .success } }
 }

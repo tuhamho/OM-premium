@@ -5,6 +5,10 @@ struct OfflineMusicApp: App {
     @StateObject private var store = MusicStore()
     @StateObject private var player = AudioPlayerService()
 
+    init() {
+        _ = PerformanceDiagnostics.launchStartedAt
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

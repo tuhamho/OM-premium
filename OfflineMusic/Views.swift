@@ -4,9 +4,9 @@ import UIKit
 
 struct RootView: View {
     @EnvironmentObject private var store: MusicStore
-    @EnvironmentObject private var player: AudioPlayerService
     @State private var tab = 0
     @State private var showNowPlaying = false
+    @State private var loggedFirstFrame = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -18,24 +18,41 @@ struct RootView: View {
                 default: HomeView()
                 }
             }
-            .safeAreaPadding(.bottom, player.currentSong == nil ? 62 : 126)
-            VStack(spacing: 0) {
-                if let song = player.currentSong {
-                    MiniPlayer(song: song) { showNowPlaying = true }
-                }
-                HStack {
-                    tabButton("house.fill", "Home", 0)
-                    tabButton("music.note.list", "Library", 1)
-                    tabButton("rectangle.stack.fill", "Playlists", 2)
-                    tabButton("gearshape.fill", "Settings", 3)
-                }
-                .padding(.top, 10).padding(.bottom, 8)
-                .background(.ultraThinMaterial)
-            }
+            .safeAreaPadding(.bottom, store.currentSongID == nil ? 62 : 126)
+            RootPlayerBar(tab: $tab) { showNowPlaying = true }
         }
         .background(Color.ink.ignoresSafeArea())
         .sheet(isPresented: $showNowPlaying) { NowPlayingView() }
         .sheet(isPresented: $store.showDebugPanel) { DebugStatusView() }
+        .onAppear {
+            guard !loggedFirstFrame else { return }
+            loggedFirstFrame = true
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - PerformanceDiagnostics.launchStartedAt) / 1_000_000
+            print(String(format: "STARTUP PERF first usable frame: %.1fms", elapsed))
+        }
+    }
+
+}
+
+private struct RootPlayerBar: View {
+    @EnvironmentObject private var player: AudioPlayerService
+    @Binding var tab: Int
+    let openNowPlaying: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let song = player.currentSong {
+                MiniPlayer(song: song, open: openNowPlaying)
+            }
+            HStack {
+                tabButton("house.fill", "Home", 0)
+                tabButton("music.note.list", "Library", 1)
+                tabButton("rectangle.stack.fill", "Playlists", 2)
+                tabButton("gearshape.fill", "Settings", 3)
+            }
+            .padding(.top, 10).padding(.bottom, 8)
+            .background(.ultraThinMaterial)
+        }
     }
 
     private func tabButton(_ icon: String, _ text: String, _ value: Int) -> some View {
@@ -53,7 +70,6 @@ struct RootView: View {
 
 struct HomeView: View {
     @EnvironmentObject private var store: MusicStore
-    @EnvironmentObject private var player: AudioPlayerService
 
     private var greeting: String {
         let hour = Calendar.current.component(.hour, from: .now)
@@ -101,7 +117,7 @@ struct HomeView: View {
                     HStack(spacing: 14) {
                         ForEach(songs) { song in
                             SongCard(song: song) {
-                                player.play(song, from: songs)
+                                store.play(song, from: songs)
                             }
                         }
                     }
@@ -113,7 +129,6 @@ struct HomeView: View {
 
 struct LibraryView: View {
     @EnvironmentObject private var store: MusicStore
-    @EnvironmentObject private var player: AudioPlayerService
     @State private var search = ""
     @State private var filter: LibraryFilter = .songs
     @State private var sort: SortMode = .recentlyAdded
@@ -214,7 +229,7 @@ struct LibraryView: View {
                             }
                         default:
                             ForEach(filtered) { song in
-                                SongRow(song: song) { player.play(song, from: filtered) }
+                                SongRow(song: song) { store.play(song, from: filtered) }
                                     .swipeActions {
                                         Button(role: .destructive) { store.delete(song) } label: {
                                             Label("Delete", systemImage: "trash")
@@ -1106,7 +1121,6 @@ struct SongRow: View {
 
 private struct SongActionsModifier: ViewModifier {
     @EnvironmentObject private var store: MusicStore
-    @EnvironmentObject private var player: AudioPlayerService
     let song: Song
     let play: () -> Void
     @State private var showingEditor = false
@@ -1123,10 +1137,10 @@ private struct SongActionsModifier: ViewModifier {
                 Button(action: play) {
                     Label("Play", systemImage: "play.fill")
                 }
-                Button { player.playNext(song) } label: {
+                Button { store.playNext(song) } label: {
                     Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
                 }
-                Button { player.addToQueue(song) } label: {
+                Button { store.addToQueue(song) } label: {
                     Label("Add to Queue", systemImage: "text.badge.plus")
                 }
                 Button { showingPlaylistPicker = true } label: {
