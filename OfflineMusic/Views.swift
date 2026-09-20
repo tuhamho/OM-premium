@@ -830,10 +830,10 @@ struct LibraryInsightsView: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Discover from My Library").font(.headline)
-                    Text("Six local songs selected daily from your existing library.")
+                    Text("Ten local songs rolling from your existing library.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    Text("\(store.dailyDiscoverSongs.count) songs ready today")
+                    Text("\(store.dailyDiscoverSongs.count) songs ready in the rolling list")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(store.accentChoice.color)
                 }
@@ -1005,9 +1005,9 @@ struct NowPlayingView: View {
                     Text(player.currentSong?.displayArtist ?? "").foregroundStyle(Color.muted)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                Slider(value: Binding(get: { player.elapsed }, set: { player.seek(to: $0) }), in: 0...max(player.currentSong?.duration ?? 1, 1))
+                Slider(value: Binding(get: { min(player.elapsed, player.duration) }, set: { player.seek(to: $0) }), in: 0...max(player.duration, 1))
                 HStack {
-                    Text(time(player.elapsed)); Spacer(); Text(time(player.currentSong?.duration ?? 0))
+                    Text(time(min(player.elapsed, player.duration))); Spacer(); Text(time(player.duration))
                 }
                 .font(.caption).foregroundStyle(Color.muted)
                 HStack {
@@ -1428,7 +1428,7 @@ struct MiniPlayer: View {
                     Button { player.toggle() } label: { Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").font(.title3) }.buttonStyle(.plain)
                     Button { player.next() } label: { Image(systemName: "forward.fill") }.buttonStyle(.plain)
                 }
-                ProgressView(value: player.currentSong?.duration == nil ? 0 : player.elapsed, total: max(player.currentSong?.duration ?? 1, 1))
+                ProgressView(value: player.duration == 0 ? 0 : min(player.elapsed, player.duration), total: max(player.duration, 1))
                     .tint(.primary)
                     .scaleEffect(y: 0.35)
             }
