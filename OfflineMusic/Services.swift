@@ -31,6 +31,13 @@ import UIKit
     @Published var lyricsFetchTotal = 0
     @Published var lyricsFetchCurrent = ""
     @Published var lyricsFetchSummary = ""
+    @Published var isImportingLyrics = false
+    @Published var lyricsImportProgress = 0
+    @Published var lyricsImportTotal = 0
+    @Published var lyricsImportCurrent = ""
+    @Published var lyricsImportSummary = ""
+    @Published var unmatchedLyricsFiles: [String] = []
+    @Published private(set) var lyricsRevision = UUID()
 
     private let stateURL: URL
     private let fm = FileManager.default
@@ -46,6 +53,13 @@ import UIKit
 
     var audioDirectory: URL {
         let dir = documentsDirectory.appendingPathComponent("Audio")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    var importedLyricsDirectory: URL {
+        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Lyrics", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -176,6 +190,7 @@ import UIKit
                     metadata.musicBrainzReleaseID = existing.musicBrainzReleaseID
                     metadata.manualLyrics = existing.manualLyrics
                     metadata.cachedOnlineLyrics = existing.cachedOnlineLyrics
+                    metadata.importedLyricsFileName = existing.importedLyricsFileName
                     if metadata.artworkData == nil { metadata.artworkData = existing.artworkData }
                     songs[index] = metadata
                 } else {
@@ -357,6 +372,7 @@ import UIKit
             local.lastPlayed = existing.lastPlayed
             local.playCount = existing.playCount
             local.isFavorite = existing.isFavorite
+            local.importedLyricsFileName = existing.importedLyricsFileName
             songs[index] = local
         }
         save()
@@ -400,7 +416,110 @@ import UIKit
 
     func localLyrics(for id: UUID) async -> LocalLyrics? {
         guard let song = songs.first(where: { $0.id == id }) else { return nil }
-        return await LocalLyricsResolver.shared.resolve(song: song, fileURL: documentURL(for: song.fileName))
+        let importedURL = song.importedLyricsFileName.map { importedLyricsDirectory.appendingPathComponent($0) }
+        return await LocalLyricsResolver.shared.resolve(
+            song: song,
+            fileURL: documentURL(for: song.fileName),
+            importedURL: importedURL
+        )
+    }
+
+    func importLyricsFiles(_ urls: [URL]) async {
+        guard !isImportingLyrics else { return }
+        isImportingLyrics = true
+        lyricsImportProgress = 0
+        lyricsImportTotal = urls.count
+        lyricsImportCurrent = ""
+        lyricsImportSummary = ""
+        unmatchedLyricsFiles = []
+
+        var imported = 0
+        var matched = 0
+        var failed = 0
+        var unmatched: [String] = []
+
+        for url in urls {
+            guard isImportingLyrics else { break }
+            lyricsImportProgress += 1
+            lyricsImportCurrent = url.lastPathComponent
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+
+            let fileExtension = url.pathExtension.lowercased()
+            guard fileExtension == "lrc" || fileExtension == "txt" else {
+                failed += 1
+                continue
+            }
+
+            let destination = importedLyricsDirectory.appendingPathComponent(url.lastPathComponent)
+            do {
+                if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+                try fm.copyItem(at: url, to: destination)
+                imported += 1
+
+                let candidates = matchingSongs(forLyricsFile: url)
+                if candidates.count == 1, let index = songs.firstIndex(where: { $0.id == candidates[0].id }) {
+                    songs[index].importedLyricsFileName = url.lastPathComponent
+                    matched += 1
+                } else {
+                    unmatched.append(url.lastPathComponent)
+                }
+            } catch {
+                failed += 1
+            }
+            await Task.yield()
+        }
+
+        let cancelled = !isImportingLyrics
+        unmatchedLyricsFiles = unmatched
+        lyricsImportSummary = cancelled
+            ? "Lyrics import cancelled • Imported: \(imported) • Matched: \(matched) • Unmatched: \(unmatched.count) • Failed: \(failed)"
+            : "Lyrics Import Complete • Imported: \(imported) • Matched: \(matched) • Unmatched: \(unmatched.count) • Failed: \(failed)"
+        isImportingLyrics = false
+        lyricsImportCurrent = ""
+        lyricsRevision = UUID()
+        save()
+        objectWillChange.send()
+    }
+
+    func cancelLyricsImport() {
+        isImportingLyrics = false
+        lyricsImportSummary = "Lyrics import cancelled"
+    }
+
+    func removeImportedLyrics(for id: UUID) {
+        guard let index = songs.firstIndex(where: { $0.id == id }) else { return }
+        if let fileName = songs[index].importedLyricsFileName {
+            let url = importedLyricsDirectory.appendingPathComponent(fileName)
+            try? fm.removeItem(at: url)
+        }
+        songs[index].importedLyricsFileName = nil
+        lyricsRevision = UUID()
+        save()
+        objectWillChange.send()
+    }
+
+    private func matchingSongs(forLyricsFile url: URL) -> [Song] {
+        let basename = url.deletingPathExtension().lastPathComponent
+        let exact = songs.filter {
+            URL(fileURLWithPath: $0.fileName).deletingPathExtension().lastPathComponent
+                .caseInsensitiveCompare(basename) == .orderedSame
+        }
+        if !exact.isEmpty { return exact }
+
+        let normalized = normalizedLyricsName(basename)
+        return songs.filter {
+            normalizedLyricsName(URL(fileURLWithPath: $0.fileName).deletingPathExtension().lastPathComponent) == normalized
+        }
+    }
+
+    private func normalizedLyricsName(_ value: String) -> String {
+        value.precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive], locale: .current)
+            .replacingOccurrences(of: #"[^\p{L}\p{N}]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
     var artistGroups: [ArtistGroup] {
         let grouped = Dictionary(grouping: songs) { artistKey(for: $0.displayArtist) }
@@ -654,7 +773,7 @@ actor LocalLyricsResolver {
         try? fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
     }
 
-    func resolve(song: Song, fileURL: URL) -> LocalLyrics? {
+    func resolve(song: Song, fileURL: URL, importedURL: URL?) -> LocalLyrics? {
         if let manual = nonEmpty(song.manualLyrics) {
             return parse(manual)
         }
@@ -665,6 +784,13 @@ actor LocalLyricsResolver {
             return plainSidecarLyrics
         }
 
+        if let importedURL,
+           importedURL.pathExtension.caseInsensitiveCompare("lrc") == .orderedSame,
+           let importedLyrics = readCachedOrParse(songID: song.id, url: importedURL),
+           importedLyrics.isSynced {
+            return importedLyrics
+        }
+
         if let embedded = nonEmpty(song.embeddedLyrics) {
             return parse(embedded)
         }
@@ -673,8 +799,19 @@ actor LocalLyricsResolver {
             return plainSidecarLyrics
         }
 
+        if let importedURL,
+           importedURL.pathExtension.caseInsensitiveCompare("lrc") == .orderedSame,
+           let importedLyrics = readCachedOrParse(songID: song.id, url: importedURL) {
+            return importedLyrics
+        }
+
         if let textSidecar = sidecarURL(for: fileURL, extension: "txt"),
            let result = readCachedOrParse(songID: song.id, url: textSidecar) {
+            return result
+        }
+        if let importedURL,
+           importedURL.pathExtension.caseInsensitiveCompare("txt") == .orderedSame,
+           let result = readCachedOrParse(songID: song.id, url: importedURL) {
             return result
         }
         return nil

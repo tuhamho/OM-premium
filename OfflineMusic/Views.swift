@@ -482,6 +482,8 @@ struct SettingsView: View {
     @EnvironmentObject private var player: AudioPlayerService
     private let playbackSpeeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
     @State private var showingResetConfirmation = false
+    @State private var showingLyricsImporter = false
+    @State private var showingUnmatchedLyrics = false
 
     var body: some View {
         NavigationStack {
@@ -522,6 +524,32 @@ struct SettingsView: View {
                     } else if !store.artworkFetchSummary.isEmpty {
                         Text(store.artworkFetchSummary)
                             .foregroundStyle(Color.muted)
+                    }
+
+                    Button("Import Lyrics Files") {
+                        showingLyricsImporter = true
+                    }
+                    .disabled(store.isImportingLyrics)
+
+                    if store.isImportingLyrics {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ProgressView()
+                            Text("Importing Lyrics")
+                            Text("\(store.lyricsImportProgress) / \(store.lyricsImportTotal)")
+                            if !store.lyricsImportCurrent.isEmpty {
+                                Text("Current: \(store.lyricsImportCurrent)")
+                                    .foregroundStyle(Color.muted)
+                            }
+                            Button("Cancel") { store.cancelLyricsImport() }
+                        }
+                    } else if !store.lyricsImportSummary.isEmpty {
+                        Text(store.lyricsImportSummary)
+                            .foregroundStyle(Color.muted)
+                        if !store.unmatchedLyricsFiles.isEmpty {
+                            Button("View Unmatched Files") {
+                                showingUnmatchedLyrics = true
+                            }
+                        }
                     }
 
                     Button("Rescan files") {
@@ -567,11 +595,49 @@ struct SettingsView: View {
             } message: {
                 Text("Embedded tags, audio files, playlists, favorites, history, and song IDs will be preserved.")
             }
+            .fileImporter(
+                isPresented: $showingLyricsImporter,
+                allowedContentTypes: lyricsImportTypes,
+                allowsMultipleSelection: true
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    Task { await store.importLyricsFiles(urls) }
+                case .failure(let error):
+                    store.lyricsImportSummary = "Lyrics import failed: \(error.localizedDescription)"
+                }
+            }
+            .sheet(isPresented: $showingUnmatchedLyrics) {
+                UnmatchedLyricsView(files: store.unmatchedLyricsFiles)
+            }
         }
+    }
+
+    private var lyricsImportTypes: [UTType] {
+        [UTType(filenameExtension: "lrc") ?? .plainText, .plainText]
     }
 
     private func speedLabel(for speed: Float) -> String {
         speed == 1.0 ? "1x" : String(format: "%.2gx", speed)
+    }
+}
+
+struct UnmatchedLyricsView: View {
+    @Environment(\.dismiss) private var dismiss
+    let files: [String]
+
+    var body: some View {
+        NavigationStack {
+            List(files, id: \.self) { file in
+                Text(file)
+            }
+            .navigationTitle("Unmatched Lyrics")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
     }
 }
 
@@ -680,6 +746,9 @@ struct LyricsView: View {
     @StateObject private var speech = LyricsSpeechManager()
 
     private var songID: UUID? { player.currentSong?.id }
+    private var lyricsLoadKey: String {
+        "\(songID?.uuidString ?? "none")-\(store.lyricsRevision.uuidString)"
+    }
     private var song: Song? { store.song(songID) }
     private var displayedLyrics: LocalLyrics? {
         if let manual = song?.manualLyrics, let value = LocalLyrics.plain(manual) { return value }
@@ -738,6 +807,11 @@ struct LyricsView: View {
                             if let lyrics = displayedLyrics {
                                 Button("Read Lyrics Aloud") { speech.read(lyrics.text, pauseMusic: { player.pause() }) }
                             }
+                            if let songID, song?.importedLyricsFileName != nil {
+                                Button("Remove Imported Lyrics", role: .destructive) {
+                                    store.removeImportedLyrics(for: songID)
+                                }
+                            }
                             Button("Stop Reading") { speech.stop() }
                         } label: { Image(systemName: "ellipsis.circle") }
                     }
@@ -751,7 +825,7 @@ struct LyricsView: View {
                     }
                 }
             }
-            .task(id: songID) {
+            .task(id: lyricsLoadKey) {
                 editing = false
                 autoFollow = true
                 isLoading = true
