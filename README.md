@@ -1,7 +1,5 @@
 # Spotúfy
 
-![Spotúfy brand icon](OfflineMusic/Assets.xcassets/SpotufyBrandIcon.imageset/SpotufyBrandIcon.png)
-
 Spotúfy is a premium, local-first music player for iPhone. It is built with SwiftUI, AVFoundation, and MediaPlayer for reliable offline playback, background audio, and lock-screen controls.
 
 ## App preview
@@ -13,7 +11,41 @@ The current app includes a dark OLED-friendly interface with four primary areas:
 - **Playlists** — create playlists and manage local songs.
 - **Settings** — playback speed, resume previous session, theme/accent controls, library tools, and insights.
 
-![Spotúfy app icon](OfflineMusic/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png)
+## Screenshots
+
+### Home
+
+![Home](docs/screenshots/anh1.png)
+
+### Library — Songs
+
+![Library songs](docs/screenshots/anh2.png)
+
+### Library — Artists
+
+![Library artists](docs/screenshots/anh3.png)
+
+### Library — Albums
+
+![Library albums](docs/screenshots/anh4.png)
+
+### Library — Favorites
+
+![Library favorites](docs/screenshots/anh5.png)
+
+### Playlists
+
+![Playlists](docs/screenshots/anh6.png)
+
+### Settings
+
+![Settings](docs/screenshots/anh7.png)
+
+### Library Insights
+
+![Library insights](docs/screenshots/anh8.png)
+
+![Now playing and library](docs/screenshots/anh9.png)
 
 ## Highlights
 
