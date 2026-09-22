@@ -90,3 +90,7 @@ OfflineMusic/
 ## License
 
 This repository is an independent personal project. Add a license before distributing it publicly.
+
+## Author
+
+**tuhamho**
