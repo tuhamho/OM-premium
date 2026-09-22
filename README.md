@@ -1,6 +1,6 @@
-# Spotúfy
+# Sờ pọt tú phai
 
-Spotúfy is a premium, local-first music player for iPhone. It is built with SwiftUI, AVFoundation, and MediaPlayer for reliable offline playback, background audio, and lock-screen controls.
+Sờ pọt tú phai is a premium, local-first music player for iPhone. It is built with SwiftUI, AVFoundation, and MediaPlayer for reliable offline playback, background audio, and lock-screen controls.
 
 ## App preview
 
