@@ -20,14 +20,14 @@ The current app includes a dark OLED-friendly interface with four primary areas:
     <td align="center" valign="top"><h2>👥 ARTISTS</h2><strong>Browse by artist</strong><br><img src="docs/screenshots/anh3.png" alt="Library artists" width="220"></td>
   </tr>
   <tr>
-    <td align="center" valign="top"><h2>💿 ALBUMS</h2><strong>Album collections</strong><br><img src="docs/screenshots/anh4.png" alt="Library albums" width="220"></td>
-    <td align="center" valign="top"><h2>♥ FAVORITES</h2><strong>Your favorite tracks</strong><br><img src="docs/screenshots/anh5.png" alt="Library favorites" width="220"></td>
-    <td align="center" valign="top"><h2>📚 PLAYLISTS</h2><strong>Organize your music</strong><br><img src="docs/screenshots/anh6.png" alt="Playlists" width="220"></td>
+    <td align="center" valign="top"><h2>💿 ALBUMS</h2><strong>Album collections</strong><br><img src="docs/screenshots/anh5.png" alt="Library albums" width="220"></td>
+    <td align="center" valign="top"><h2>♥ FAVORITES</h2><strong>Your favorite tracks</strong><br><img src="docs/screenshots/anh6.png" alt="Library favorites" width="220"></td>
+    <td align="center" valign="top"><h2>📚 PLAYLISTS</h2><strong>Organize your music</strong><br><img src="docs/screenshots/anh7.png" alt="Playlists" width="220"></td>
   </tr>
   <tr>
-    <td align="center" valign="top"><h2>⚙ SETTINGS</h2><strong>Playback & appearance</strong><br><img src="docs/screenshots/anh7.png" alt="Settings" width="220"></td>
-    <td align="center" valign="top"><h2>📊 INSIGHTS</h2><strong>Library statistics</strong><br><img src="docs/screenshots/anh8.png" alt="Library insights" width="220"></td>
-    <td align="center" valign="top"><h2>▶ NOW PLAYING</h2><strong>Playback controls</strong><br><img src="docs/screenshots/anh9.png" alt="Now playing" width="220"></td>
+    <td align="center" valign="top"><h2>⚙ SETTINGS</h2><strong>Playback & appearance</strong><br><img src="docs/screenshots/anh8.png" alt="Settings" width="220"></td>
+    <td align="center" valign="top"><h2>📊 INSIGHTS</h2><strong>Library statistics</strong><br><img src="docs/screenshots/anh9.png" alt="Library insights" width="220"></td>
+    <td align="center" valign="top"><h2>🎵 SONGS</h2><strong>Library alternate view</strong><br><img src="docs/screenshots/anh3.png" alt="Library songs alternate view" width="220"></td>
   </tr>
 </table>
 
