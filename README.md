@@ -13,39 +13,23 @@ The current app includes a dark OLED-friendly interface with four primary areas:
 
 ## Screenshots
 
-### Home
-
-![Home](docs/screenshots/anh1.png)
-
-### Library — Songs
-
-![Library songs](docs/screenshots/anh2.png)
-
-### Library — Artists
-
-![Library artists](docs/screenshots/anh3.png)
-
-### Library — Albums
-
-![Library albums](docs/screenshots/anh4.png)
-
-### Library — Favorites
-
-![Library favorites](docs/screenshots/anh5.png)
-
-### Playlists
-
-![Playlists](docs/screenshots/anh6.png)
-
-### Settings
-
-![Settings](docs/screenshots/anh7.png)
-
-### Library Insights
-
-![Library insights](docs/screenshots/anh8.png)
-
-![Now playing and library](docs/screenshots/anh9.png)
+<table>
+  <tr>
+    <td><strong>Home</strong><br><img src="docs/screenshots/anh1.png" alt="Home" width="220"></td>
+    <td><strong>Library — Songs</strong><br><img src="docs/screenshots/anh2.png" alt="Library songs" width="220"></td>
+    <td><strong>Library — Artists</strong><br><img src="docs/screenshots/anh3.png" alt="Library artists" width="220"></td>
+  </tr>
+  <tr>
+    <td><strong>Library — Albums</strong><br><img src="docs/screenshots/anh4.png" alt="Library albums" width="220"></td>
+    <td><strong>Library — Favorites</strong><br><img src="docs/screenshots/anh5.png" alt="Library favorites" width="220"></td>
+    <td><strong>Playlists</strong><br><img src="docs/screenshots/anh6.png" alt="Playlists" width="220"></td>
+  </tr>
+  <tr>
+    <td><strong>Settings</strong><br><img src="docs/screenshots/anh7.png" alt="Settings" width="220"></td>
+    <td><strong>Library Insights</strong><br><img src="docs/screenshots/anh8.png" alt="Library insights" width="220"></td>
+    <td><strong>Now Playing</strong><br><img src="docs/screenshots/anh9.png" alt="Now playing" width="220"></td>
+  </tr>
+</table>
 
 ## Highlights
 
